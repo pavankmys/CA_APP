@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment / secrets — NEVER commit real keys
+.env
+
+# SQLite database (user data, not source)
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
