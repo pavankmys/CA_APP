@@ -2,6 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import datetime
 import json
+import os
 import time
 from database import (
     update_srs_item, get_subject_list, get_due_mcqs,
@@ -11,6 +12,37 @@ from database import (
 )
 
 st.set_page_config(page_title="CA Inter SRS Practice App", layout="wide")
+
+# ── Password gate ─────────────────────────────────────────────────────────────
+def _check_password() -> bool:
+    """Shows a password prompt and returns True once the correct password
+    has been entered. If APP_PASSWORD is not configured, the gate is skipped."""
+    if st.session_state.get("authenticated"):
+        return True
+
+    try:
+        correct_password = st.secrets["APP_PASSWORD"]
+    except Exception:
+        correct_password = os.environ.get("APP_PASSWORD")
+
+    if not correct_password:
+        return True
+
+    st.title("🔒 CA Inter Practice Engine")
+    with st.form("login_form"):
+        pwd = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", type="primary")
+    if submitted:
+        if pwd == correct_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+    return False
+
+
+if not _check_password():
+    st.stop()
 
 # ── Session state init for mock test ─────────────────────────────────────────
 for key, default in [
