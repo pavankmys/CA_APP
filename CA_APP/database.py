@@ -5,9 +5,21 @@ import random
 import re
 
 import psycopg2
+import psycopg2.extensions
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Postgres NUMERIC columns (ease_factor, *_pct, time_spent_seconds, etc.) are
+# returned as decimal.Decimal by psycopg2, which cannot be mixed with floats
+# in arithmetic (e.g. `decimal.Decimal - float`). Cast them to float globally
+# so callers can treat all numeric results as plain floats.
+_DEC2FLOAT = psycopg2.extensions.new_type(
+    psycopg2.extensions.DECIMAL.values,
+    'DEC2FLOAT',
+    lambda value, curs: float(value) if value is not None else None,
+)
+psycopg2.extensions.register_type(_DEC2FLOAT)
 
 DIFFICULTY_POINTS = {'easy': 1, 'medium': 2, 'hard': 3}
 CPA_EXAM_MIN_MCQS = 50  # Minimum MCQs for a valid proficiency assessment
