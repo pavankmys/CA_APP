@@ -131,7 +131,11 @@ DISTRACTOR DESIGN — what makes ICAI questions hard:
 EXPLANATION STRUCTURE:
 1. Governing provision: "Section X of Y Act" / "AS X — [Name]" / "SA XXX — [Name]"
 2. Step-by-step working (mandatory for numerical questions; show every step)
-3. Why Distractor 1 is wrong | Why Distractor 2 is wrong | Why Distractor 3 is wrong
+3. Why each incorrect option is wrong — refer to each ONLY by its content (e.g., "the ₹5,40,000 \
+figure", "treating it as deferred revenue expenditure"), NEVER by its letter (A/B/C/D), position \
+(1st/2nd/3rd/4th), or as "Distractor X"/"option (a)" etc. Options are reordered at random AFTER \
+this explanation is written, so any letter/position reference will become incorrect and mislead \
+the student.
 Maximum 150 words. Concise but complete.
 
 SUBJECT-SPECIFIC RULES:
@@ -287,7 +291,9 @@ in the source material.
 - Arrange numeric options in ascending order so position does not hint at the answer
 - NEVER use "All of the above" / "None of the above" / "Both (a) and (b)" style options
 - Explanation: (1) governing provision — exact Section/AS/SA number; (2) step-by-step working for \
-numerical sub-questions; (3) why each wrong option is incorrect. Maximum 150 words per sub-question.
+numerical sub-questions; (3) why each wrong option is incorrect — refer to each ONLY by its content, \
+NEVER by its letter (A/B/C/D) or position, since options are reordered at random after generation. \
+Maximum 150 words per sub-question.
 
 === SUBJECT-SPECIFIC GUIDANCE ===
 
