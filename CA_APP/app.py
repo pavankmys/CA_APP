@@ -392,7 +392,7 @@ with tab4:
             with col1:
                 selected = st.selectbox("Select Subject", ["All Subjects"] + subjects)
             with col2:
-                num_q = st.selectbox("Number of MCQs", [50, 75, 100], index=0)
+                num_q = st.selectbox("Number of MCQs", [10, 25, 50, 75, 100], index=0)
 
             mock_mcq_count, n_chapters_with_sims, total_sims_avail = get_cpa_exam_availability(selected)
 
