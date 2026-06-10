@@ -56,6 +56,7 @@ for key, default in [
     ("mock_start_time",  None),
     ("mock_result",      None),
     ("mock_subject",     "All Subjects"),
+    ("deck_session_seconds", 0.0),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -95,6 +96,18 @@ with tab1:
 
     all_subjects = get_subject_list()
 
+    deck_mode = st.radio(
+        "Mode", ["📘 Practice Mode", "📝 Exam Mode"],
+        horizontal=True,
+        help="Practice Mode: one attempt, explanation shown immediately, no live timer. "
+             "Exam Mode: up to 2 attempts, live timer, explanation shown after attempts are used up."
+    )
+    is_practice_mode = deck_mode.startswith("📘")
+
+    total_min = int(st.session_state.deck_session_seconds // 60)
+    total_sec = int(st.session_state.deck_session_seconds % 60)
+    st.caption(f"⏱ Total time spent this session: {total_min}m {total_sec}s")
+
     selected_subject = st.selectbox("Select Subject to Practice", ["All Subjects"] + all_subjects)
     test_mode = st.checkbox("🔄 Force Study Mode (Ignore SRS dates)", value=True)
 
@@ -129,29 +142,30 @@ with tab1:
 
         # ── ANSWERING PHASE ───────────────────────────────────────────────────
         if not st.session_state.q1_answered:
-            # Live timer (JavaScript, counts up from question-load epoch)
-            epoch_ms = int(st.session_state.q1_start_time * 1000)
-            components.html(
-                f"""<script>
-                var s={epoch_ms};
-                function tick(){{
-                    var el=document.getElementById('t');
-                    if(el){{el.textContent='⏱ '+Math.floor((Date.now()-s)/1000)+'s elapsed';}}
-                    setTimeout(tick,500);
-                }}
-                tick();
-                </script>
-                <div id="t" style="font-size:13px;color:#888;font-family:monospace;">⏱ 0s elapsed</div>""",
-                height=28, scrolling=False
-            )
-
-            # Show "try again" warning after a wrong first attempt
-            if st.session_state.q1_attempts == 1:
-                remaining = 2 - st.session_state.q1_attempts
-                st.warning(
-                    f"❌ Attempt 1 was incorrect — **try again** "
-                    f"({remaining} attempt remaining)"
+            if not is_practice_mode:
+                # Live timer (JavaScript, counts up from question-load epoch) — Exam Mode only
+                epoch_ms = int(st.session_state.q1_start_time * 1000)
+                components.html(
+                    f"""<script>
+                    var s={epoch_ms};
+                    function tick(){{
+                        var el=document.getElementById('t');
+                        if(el){{el.textContent='⏱ '+Math.floor((Date.now()-s)/1000)+'s elapsed';}}
+                        setTimeout(tick,500);
+                    }}
+                    tick();
+                    </script>
+                    <div id="t" style="font-size:13px;color:#888;font-family:monospace;">⏱ 0s elapsed</div>""",
+                    height=28, scrolling=False
                 )
+
+                # Show "try again" warning after a wrong first attempt
+                if st.session_state.q1_attempts == 1:
+                    remaining = 2 - st.session_state.q1_attempts
+                    st.warning(
+                        f"❌ Attempt 1 was incorrect — **try again** "
+                        f"({remaining} attempt remaining)"
+                    )
 
             user_choice_label = st.radio(
                 "Choose the correct alternative:", option_labels,
@@ -166,7 +180,14 @@ with tab1:
                 st.session_state.q1_elapsed  = elapsed
                 is_correct = (user_choice_letter == correct)
 
-                if is_correct:
+                if is_practice_mode:
+                    # Single attempt — reveal the answer & explanation immediately
+                    st.session_state.q1_correct  = is_correct
+                    st.session_state.q1_answered = True
+                    st.session_state.q1_rating   = _compute_srs_rating(
+                        elapsed, st.session_state.q1_attempts, is_correct
+                    )
+                elif is_correct:
                     st.session_state.q1_correct  = True
                     st.session_state.q1_answered = True
                     st.session_state.q1_rating   = _compute_srs_rating(
@@ -214,6 +235,7 @@ with tab1:
                 update_srs_item(mcq_id, rating,
                                 time_spent_seconds=int(elapsed),
                                 attempts=attempts)
+                st.session_state.deck_session_seconds += elapsed
                 for k in ("q1_mcq_id", "q1_start_time", "q1_attempts", "q1_answered",
                           "q1_correct", "q1_rating", "q1_elapsed", "q1_last"):
                     st.session_state.pop(k, None)
