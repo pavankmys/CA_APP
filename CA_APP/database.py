@@ -22,8 +22,8 @@ _DEC2FLOAT = psycopg2.extensions.new_type(
 psycopg2.extensions.register_type(_DEC2FLOAT)
 
 DIFFICULTY_POINTS = {'easy': 1, 'medium': 2, 'hard': 3}
-CPA_EXAM_MIN_MCQS = 50  # Minimum MCQs for a valid proficiency assessment
-CPA_EXAM_MIN_SIMS = 5   # Minimum simulations for a valid proficiency assessment
+CPA_EXAM_MIN_MCQS = 10  # Minimum MCQs for a valid proficiency assessment
+CPA_EXAM_MIN_SIMS = 1   # Minimum simulations for a valid proficiency assessment
 
 
 def _norm_q(text: str) -> str:
