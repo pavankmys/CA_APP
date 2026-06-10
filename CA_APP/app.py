@@ -1,68 +1,29 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import sqlite3
 import datetime
 import json
-import os
 import time
-from dotenv import load_dotenv
 from database import (
-    init_db, save_generated_mcqs, update_srs_item, DB_NAME,
-    get_mock_test_questions, save_mock_test, get_mock_test_history,
-    get_analytics_data, DIFFICULTY_POINTS, MOCK_TEST_MIN_QUESTIONS,
-    get_question_bank_summary, delete_chapter_mcqs, delete_subject_mcqs,
-    remove_duplicate_mcqs,
+    update_srs_item, get_subject_list, get_due_mcqs,
+    get_cpa_exam_availability, get_cpa_exam_mcqs, get_cpa_exam_simulations,
+    save_cpa_exam, get_cpa_exam_history,
+    get_analytics_data, DIFFICULTY_POINTS, CPA_EXAM_MIN_MCQS, CPA_EXAM_MIN_SIMS,
 )
-from parser import process_pdf_and_generate, extract_text_chunks, generate_from_chunk
-
-load_dotenv()
 
 st.set_page_config(page_title="CA Inter SRS Practice App", layout="wide")
-init_db()
-
-# ── Sidebar ──────────────────────────────────────────────────────────────────
-provider = os.getenv("AI_PROVIDER", "gemini").lower()
-
-st.sidebar.title("Configuration Panel")
-_provider_models = {
-    "gemini":  "gemini-2.5-flash",
-    "claude":  "claude-haiku-4-5",
-    "grok":    "grok-3-mini",
-    "kimchi":  "kimi-k2.5",
-}
-st.sidebar.info(
-    f"**AI Provider:** {provider.upper()}  \n"
-    f"**Model:** {_provider_models.get(provider, provider)}  \n\n"
-    f"Change via `AI_PROVIDER` in `.env`"
-)
-
-if provider == "claude":
-    env_key = os.getenv("ANTHROPIC_API_KEY", "")
-    key_label = "Anthropic API Key (override)"
-elif provider == "grok":
-    env_key = os.getenv("XAI_API_KEY", "")
-    key_label = "xAI API Key (override)"
-elif provider == "kimchi":
-    env_key = os.getenv("KIMCHI_API_KEY", "")
-    key_label = "Kimchi API Key (override)"
-else:
-    env_key = os.getenv("GEMINI_API_KEY", "")
-    key_label = "Gemini API Key (override)"
-
-key_override = st.sidebar.text_input(key_label, value="", type="password",
-                                     help="Leave blank to use the key from .env")
-api_key = key_override if key_override else env_key
 
 # ── Session state init for mock test ─────────────────────────────────────────
 for key, default in [
-    ("mock_screen",     "setup"),
-    ("mock_questions",  []),
-    ("mock_idx",        0),
-    ("mock_answers",    {}),
-    ("mock_start_time", None),
-    ("mock_result",     None),
-    ("mock_subject",    "All Subjects"),
-    ("delete_confirm",  None),   # (subject, chapter) or ("subject", subject) pending confirmation
+    ("mock_screen",      "setup"),
+    ("mock_questions",   []),
+    ("mock_idx",         0),
+    ("mock_answers",     {}),
+    ("mock_sims",        []),
+    ("mock_sim_idx",     0),
+    ("mock_sim_answers", {}),
+    ("mock_start_time",  None),
+    ("mock_result",      None),
+    ("mock_subject",     "All Subjects"),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -87,12 +48,11 @@ def _compute_srs_rating(elapsed: float, attempts: int, is_correct: bool) -> int:
     return 4  # correct first attempt, 11-60 s
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-st.title("📚 CA Inter Local Practice Engine")
-tab1, tab2, tab3, tab4 = st.tabs([
+st.title("📚 CA Inter Practice Engine")
+tab1, tab3, tab4 = st.tabs([
     "🎯 Daily Practice Deck",
-    "📥 Ingest Study Material",
-    "📊 Local Analytics",
-    "📝 Mock Test"
+    "📊 Analytics",
+    "📝 CPA Simulation Exam"
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,40 +61,12 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     st.header("Your Reviews for Today")
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM subjects")
-    all_subjects = [r[0] for r in cursor.fetchall()]
-    conn.close()
+    all_subjects = get_subject_list()
 
     selected_subject = st.selectbox("Select Subject to Practice", ["All Subjects"] + all_subjects)
     test_mode = st.checkbox("🔄 Force Study Mode (Ignore SRS dates)", value=True)
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
-    query = '''
-        SELECT m.id, m.question, m.options, m.correct_option, m.explanation, c.name, sub.name
-        FROM mcqs m
-        JOIN srs_states s ON m.id = s.mcq_id
-        JOIN chapters c ON m.chapter_id = c.id
-        JOIN subjects sub ON c.subject_id = sub.id
-        WHERE m.is_retired = 0
-    '''
-    params = []
-    if selected_subject != "All Subjects":
-        query += " AND sub.name = ?"
-        params.append(selected_subject)
-
-    if test_mode:
-        query += " ORDER BY s.repetitions ASC, s.next_review ASC"
-    else:
-        query += " AND s.next_review <= ? ORDER BY s.next_review ASC"
-        params.append(datetime.date.today().isoformat())
-
-    cursor.execute(query, params)
-    due_items = cursor.fetchall()
-    conn.close()
+    due_items = get_due_mcqs(selected_subject, test_mode)
 
     if not due_items:
         st.success("🎉 No active cards found for this selection.")
@@ -243,15 +175,6 @@ with tab1:
                     f"Correct answer: **{correct}**"
                 )
 
-            st.markdown(f"**Explanation:** {explanation}")
-
-            # Show auto-computed SRS rating (read-only)
-            label, desc = _RATING_META.get(rating, ("📊 Recorded", ""))
-            st.info(
-                f"**Auto SRS rating:** {label}  \n"
-                f"{desc} · {int(elapsed)}s · {attempts} attempt(s)"
-            )
-
             if st.button("Load Next →", use_container_width=True, type="primary"):
                 update_srs_item(mcq_id, rating,
                                 time_spent_seconds=int(elapsed),
@@ -260,177 +183,6 @@ with tab1:
                           "q1_correct", "q1_rating", "q1_elapsed", "q1_last"):
                     st.session_state.pop(k, None)
                 st.rerun()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TAB 2: INGESTION
-# ─────────────────────────────────────────────────────────────────────────────
-with tab2:
-    st.header("Upload New ICAI Materials")
-    st.info(
-        f"Provider: **{provider.upper()}** | "
-        "Upload the full PDF — it will be automatically split into ~20-page sections and processed."
-    )
-
-    subject_input = st.text_input("Enter Subject Name (e.g., 'Advanced Accounting')")
-    chapter_input = st.text_input("Enter Chapter / Ref Name (e.g., 'Chapter 1-3: Partnership Accounts')")
-    uploaded_file = st.file_uploader("Choose a source PDF file", type=["pdf"])
-    mcqs_per_section = st.slider(
-        "MCQs per section (~20 pages each)", min_value=5, max_value=30, value=15,
-        help="Each ~20-page section generates this many MCQs. A 192-page PDF → ~9 sections → ~135 MCQs at default."
-    )
-
-    if uploaded_file:
-        size_kb = uploaded_file.size / 1024
-        est_sections = max(1, round((size_kb * 1750) / (8 * 40000)))
-        st.caption(
-            f"📄 **{uploaded_file.name}** — {size_kb:.0f} KB "
-            f"(estimated ~{est_sections} sections → ~{est_sections * mcqs_per_section} MCQs)"
-        )
-
-    if st.button("Parse & Generate MCQs", type="primary"):
-        if not api_key:
-            st.error(f"Please supply a valid {provider.upper()} API Key via `.env` or the sidebar.")
-        elif not subject_input or not chapter_input or not uploaded_file:
-            st.warning("Please complete all input fields.")
-        else:
-            file_bytes = uploaded_file.read()
-
-            with st.spinner("Splitting PDF into sections..."):
-                try:
-                    # Kimchi (kimi-k2.5) does extensive CoT reasoning — smaller chunks
-                    # keep each call under ~100s and avoid Cloudflare proxy timeouts.
-                    kimchi_chunk_size = 8000
-                    chunk_size = kimchi_chunk_size if provider == "kimchi" else None
-                    chunks = extract_text_chunks(file_bytes, **({} if chunk_size is None else {"chunk_size": chunk_size}))
-                except Exception as e:
-                    st.error(f"PDF extraction failed: {str(e)}")
-                    st.stop()
-
-            total_sections = len(chunks)
-            st.info(f"📊 Found **{total_sections} sections** — generating up to {total_sections * mcqs_per_section} MCQs total")
-
-            progress_bar = st.progress(0)
-            status = st.empty()
-            total_mcqs = 0
-            failed_chunks = []   # [(original_index, chunk_text, error_str)]
-
-            # ── First pass ────────────────────────────────────────────────────
-            for i, chunk in enumerate(chunks):
-                status.text(f"⚙️  Section {i + 1} of {total_sections} — calling {provider.upper()}...")
-                try:
-                    mcqs = generate_from_chunk(chunk, api_key, mcqs_per_section, provider=provider,
-                                               subject=subject_input.strip(), chapter=chapter_input.strip())
-                    save_generated_mcqs(subject_input.strip(), chapter_input.strip(), mcqs)
-                    total_mcqs += len(mcqs)
-                except Exception as e:
-                    failed_chunks.append((i, chunk, str(e)[:200]))
-                progress_bar.progress((i + 1) / total_sections)
-
-            # ── Automatic retry for failed sections ───────────────────────────
-            final_errors = []
-            if failed_chunks:
-                status.text(f"🔄 Retrying {len(failed_chunks)} failed section(s)...")
-                retry_bar = st.progress(0)
-                for j, (i, chunk, _) in enumerate(failed_chunks):
-                    status.text(f"🔄 Retrying section {i + 1} ({j + 1} of {len(failed_chunks)})...")
-                    try:
-                        mcqs = generate_from_chunk(chunk, api_key, mcqs_per_section, provider=provider,
-                                                   subject=subject_input.strip(), chapter=chapter_input.strip())
-                        save_generated_mcqs(subject_input.strip(), chapter_input.strip(), mcqs)
-                        total_mcqs += len(mcqs)
-                    except Exception as e:
-                        final_errors.append((i + 1, str(e)[:200]))
-                    retry_bar.progress((j + 1) / len(failed_chunks))
-                retry_bar.empty()
-
-            status.empty()
-            progress_bar.empty()
-
-            if final_errors:
-                st.warning(f"⚠️ {len(final_errors)} section(s) still failed after retry:")
-                for sec_num, err in final_errors:
-                    st.error(f"Section {sec_num}: {err}")
-
-            successful = total_sections - len(final_errors)
-            st.success(
-                f"✅ Done! Saved **{total_mcqs} MCQs** from {successful}/{total_sections} sections "
-                f"into the database for *{subject_input.strip()}*."
-            )
-
-    # ── Question Bank Management ──────────────────────────────────────────────
-    st.divider()
-    with st.expander("Manage Question Bank", expanded=False):
-        summary = get_question_bank_summary()
-
-        if not summary:
-            st.info("No questions in the bank yet. Upload a PDF above to get started.")
-        else:
-            # ── Summary table ─────────────────────────────────────────────────
-            st.subheader("Current Bank")
-            total_in_bank = sum(r[2] for r in summary)
-            st.caption(f"Total: **{total_in_bank} questions** across {len(summary)} chapter(s)")
-
-            rows_display = [{"Subject": s, "Chapter": c, "MCQs": n} for s, c, n in summary]
-            st.table(rows_display)
-
-            # ── Deduplication ─────────────────────────────────────────────────
-            st.subheader("Remove Duplicates")
-            if st.button("Scan & Remove Duplicate Questions", use_container_width=True):
-                removed = remove_duplicate_mcqs()
-                if removed:
-                    st.success(f"Removed {removed} duplicate question(s).")
-                else:
-                    st.info("No duplicates found — bank is clean.")
-
-            st.divider()
-
-            # ── Delete controls ───────────────────────────────────────────────
-            st.subheader("Delete Questions")
-            subjects_in_bank = sorted({r[0] for r in summary})
-            del_subject = st.selectbox("Select subject", subjects_in_bank, key="del_subject")
-
-            chapters_for_subj = [r[1] for r in summary if r[0] == del_subject]
-            del_scope = st.radio(
-                "Delete scope",
-                ["Entire subject", "Specific chapter"],
-                horizontal=True,
-                key="del_scope"
-            )
-
-            del_chapter = None
-            if del_scope == "Specific chapter":
-                del_chapter = st.selectbox("Select chapter", chapters_for_subj, key="del_chapter")
-
-            # Count questions that would be deleted
-            if del_scope == "Entire subject":
-                del_count = sum(r[2] for r in summary if r[0] == del_subject)
-                del_label = f"all {del_count} questions in **{del_subject}**"
-                del_key   = ("subject", del_subject)
-            else:
-                del_count = next((r[2] for r in summary if r[0] == del_subject and r[1] == del_chapter), 0)
-                del_label = f"{del_count} questions in **{del_subject} › {del_chapter}**"
-                del_key   = ("chapter", del_subject, del_chapter)
-
-            if st.button(f"Delete {del_label}", type="secondary", use_container_width=True):
-                st.session_state.delete_confirm = del_key
-
-            # Confirmation step
-            if st.session_state.delete_confirm == del_key:
-                st.warning(f"Are you sure? This will permanently delete {del_label}. This cannot be undone.")
-                col_yes, col_no = st.columns(2)
-                with col_yes:
-                    if st.button("Yes, delete permanently", type="primary", use_container_width=True):
-                        if del_key[0] == "subject":
-                            n = delete_subject_mcqs(del_key[1])
-                        else:
-                            n = delete_chapter_mcqs(del_key[1], del_key[2])
-                        st.session_state.delete_confirm = None
-                        st.success(f"Deleted {n} question(s).")
-                        st.rerun()
-                with col_no:
-                    if st.button("Cancel", use_container_width=True):
-                        st.session_state.delete_confirm = None
-                        st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 3: ANALYTICS
@@ -558,44 +310,45 @@ with tab3:
         ch_rows.sort(key=lambda r: float(r["Confidence"].rstrip("%")))
         st.table(ch_rows)
 
-    # ══ SECTION 4: MOCK TEST HISTORY (unchanged) ══════════════════════════════
-    mock_history = data.get('mock_history', [])
-    if mock_history:
+    # ══ SECTION 4: CPA EXAM HISTORY ════════════════════════════════════════════
+    exam_history = data.get('exam_history', [])
+    if exam_history:
         st.divider()
-        st.subheader("Mock Test History")
-        mock_rows = []
-        for row in mock_history:
-            date, subj, pct, proficient, total_qm, earned, max_s = row
+        st.subheader("CPA Exam History")
+        exam_rows = []
+        for row in exam_history:
+            date, subj, mcq_pct, sim_pct, overall_pct, proficient, mcq_total, sim_total = row
             verdict = "✅ Proficient" if proficient else "❌ Not Proficient"
-            mock_rows.append({
-                "Date":       date,
-                "Subject":    subj,
-                "Questions":  total_qm,
-                "Score":      f"{earned}/{max_s}",
-                "Percentage": f"{pct}%",
-                "Result":     verdict,
+            exam_rows.append({
+                "Date":      date,
+                "Subject":   subj,
+                "MCQs":      mcq_total,
+                "MCQ %":     f"{mcq_pct}%",
+                "Sims":      sim_total,
+                "Sim %":     f"{sim_pct}%",
+                "Overall %": f"{overall_pct}%",
+                "Result":    verdict,
             })
-        st.table(mock_rows)
+        st.table(exam_rows)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 4: MOCK TEST
 # ─────────────────────────────────────────────────────────────────────────────
 with tab4:
-    st.header("Mock Test — CPA-Style Weighted Scoring")
+    st.header("CPA Simulation Exam")
     st.caption(
-        f"Easy = 1pt | Medium = 2pts | Hard = 3pts | "
-        f"Proficient at **75%+** with minimum **{MOCK_TEST_MIN_QUESTIONS} questions**"
+        "MCQ section: Easy = 1pt | Medium = 2pts | Hard = 3pts (weighted %). "
+        "Simulation section: simple correct/total %. "
+        "Overall % = average of MCQ % and Simulation %. "
+        f"Proficient at **75%+ overall** with minimum **{CPA_EXAM_MIN_MCQS} MCQs** "
+        f"and **{CPA_EXAM_MIN_SIMS} simulations**."
     )
 
     screen = st.session_state.mock_screen
 
     # ── SETUP SCREEN ──────────────────────────────────────────────────────────
     if screen == "setup":
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM subjects")
-        subjects = [r[0] for r in cursor.fetchall()]
-        conn.close()
+        subjects = get_subject_list()
 
         if not subjects:
             st.warning("No subjects found. Ingest some PDFs first.")
@@ -604,176 +357,248 @@ with tab4:
             with col1:
                 selected = st.selectbox("Select Subject", ["All Subjects"] + subjects)
             with col2:
-                num_q = st.selectbox("Number of Questions", [50, 75, 100], index=0)
+                num_q = st.selectbox("Number of MCQs", [50, 75, 100], index=0)
 
-            # Count available questions
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            count_query = "SELECT COUNT(*) FROM mcqs m JOIN chapters c ON m.chapter_id=c.id JOIN subjects sub ON c.subject_id=sub.id WHERE m.is_retired=0"
-            count_params = []
-            if selected != "All Subjects":
-                count_query += " AND sub.name = ?"
-                count_params.append(selected)
-            available = cursor.execute(count_query, count_params).fetchone()[0]
-            conn.close()
+            mock_mcq_count, n_chapters_with_sims, total_sims_avail = get_cpa_exam_availability(selected)
 
-            st.info(f"**{available}** questions available for *{selected}*")
+            st.info(
+                f"**{mock_mcq_count}** mock MCQs and **{total_sims_avail}** simulations "
+                f"across **{n_chapters_with_sims}** chapter(s) available for *{selected}*"
+            )
 
-            if available < MOCK_TEST_MIN_QUESTIONS:
-                st.error(
-                    f"Need at least **{MOCK_TEST_MIN_QUESTIONS} questions** for a valid mock test. "
-                    f"Currently **{available}** available. "
-                    f"Ingest more PDFs in the Ingest tab to build up your question bank."
-                )
+            mcq_ok = mock_mcq_count >= CPA_EXAM_MIN_MCQS
+            sim_ok = n_chapters_with_sims >= CPA_EXAM_MIN_SIMS
+
+            if not mcq_ok or not sim_ok:
+                if not mcq_ok:
+                    st.error(
+                        f"Need at least **{CPA_EXAM_MIN_MCQS} mock MCQs** for a valid exam. "
+                        f"Currently **{mock_mcq_count}** available."
+                    )
+                if not sim_ok:
+                    st.error(
+                        f"Need simulations covering at least **{CPA_EXAM_MIN_SIMS} chapter(s)** for a valid exam. "
+                        f"Currently **{n_chapters_with_sims}** chapter(s) covered."
+                    )
+                st.info("Generate more mock exam content in the Ingest app to build up the pool.")
             else:
-                if available < num_q:
-                    st.warning(f"Only {available} questions available — test will use all of them.")
+                if mock_mcq_count < num_q:
+                    st.warning(f"Only {mock_mcq_count} mock MCQs available — exam will use all of them.")
 
-                if st.button("🚀 Start Mock Test", type="primary", use_container_width=True):
-                    questions = get_mock_test_questions(selected, num_q)
-                    if not questions:
-                        st.error("Could not load questions.")
+                if st.button("🚀 Start CPA Simulation Exam", type="primary", use_container_width=True):
+                    questions = get_cpa_exam_mcqs(selected, num_q)
+                    sims = get_cpa_exam_simulations(selected)
+                    if not questions or not sims:
+                        st.error("Could not load exam content.")
                     else:
-                        st.session_state.mock_questions  = questions
-                        st.session_state.mock_idx        = 0
-                        st.session_state.mock_answers    = {}
-                        st.session_state.mock_start_time = time.time()
-                        st.session_state.mock_subject    = selected
-                        st.session_state.mock_screen     = "testing"
+                        st.session_state.mock_questions   = questions
+                        st.session_state.mock_idx         = 0
+                        st.session_state.mock_answers     = {}
+                        st.session_state.mock_sims        = sims
+                        st.session_state.mock_sim_idx     = 0
+                        st.session_state.mock_sim_answers = {}
+                        st.session_state.mock_start_time  = time.time()
+                        st.session_state.mock_subject     = selected
+                        st.session_state.mock_screen      = "testing"
                         st.rerun()
 
         # Recent history
-        history = get_mock_test_history(limit=5)
+        history = get_cpa_exam_history(limit=5)
         if history:
             st.divider()
-            st.subheader("Recent Mock Tests")
+            st.subheader("Recent CPA Exams")
             for row in history:
-                _, subj, date, total_q, earned, max_s, pct, proficient, secs = row
+                _, subj, date, mcq_pct, sim_pct, overall_pct, proficient, mcq_total, sim_total, secs = row
                 badge = "✅" if proficient else "❌"
                 mins, secsR = divmod(int(secs or 0), 60)
                 st.markdown(
-                    f"{badge} **{date}** | {subj} | {total_q}Q | "
-                    f"Score: {earned}/{max_s} ({pct}%) | {mins}m {secsR}s"
+                    f"{badge} **{date}** | {subj} | "
+                    f"MCQ {mcq_pct}% ({mcq_total}Q) | Sim {sim_pct}% ({sim_total}Q) | "
+                    f"Overall {overall_pct}% | {mins}m {secsR}s"
                 )
 
     # ── TESTING SCREEN ────────────────────────────────────────────────────────
     elif screen == "testing":
-        questions = st.session_state.mock_questions
-        idx       = st.session_state.mock_idx
-        total     = len(questions)
-        q         = questions[idx]
+        questions  = st.session_state.mock_questions
+        idx        = st.session_state.mock_idx
+        total_mcqs = len(questions)
+        sims       = st.session_state.mock_sims
+        sim_idx    = st.session_state.mock_sim_idx
+        total_sims = len(sims)
+        total_items = total_mcqs + total_sims
 
         elapsed = int(time.time() - (st.session_state.mock_start_time or time.time()))
         elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
 
-        st.progress((idx) / total)
-        st.caption(f"Question {idx + 1} of {total} | Elapsed: {elapsed_str}")
+        def _finalize_exam(mcq_done, sims_done):
+            elapsed_final = int(time.time() - st.session_state.mock_start_time)
+            result = save_cpa_exam(
+                st.session_state.mock_subject,
+                mcq_done,
+                st.session_state.mock_answers,
+                sims_done,
+                st.session_state.mock_sim_answers,
+                elapsed_final
+            )
 
-        diff_badge = {"easy": "🟢 Easy", "medium": "🟡 Medium", "hard": "🔴 Hard"}.get(
-            q['difficulty'], "🟡 Medium"
-        )
-        st.markdown(f"**{q['subject']} › {q['chapter']}** | {diff_badge}")
-        st.subheader(f"Q{idx + 1}. {q['question']}")
+            mcq_per_question = []
+            for qs in mcq_done:
+                ua = st.session_state.mock_answers.get(qs['mcq_id'])
+                mcq_per_question.append({**qs, 'user_answer': ua, 'is_correct': ua == qs['correct']})
 
-        opts = q['options']
-        option_labels = [f"{k}) {v}" for k, v in sorted(opts.items())]
-        choice = st.radio("Select your answer:", option_labels, key=f"mock_radio_{idx}")
-        selected_letter = choice[0]
+            sim_review = []
+            for sim in sims_done:
+                sub_review = []
+                for sq in sim['sub_questions']:
+                    ua = st.session_state.mock_sim_answers.get(sq['id'])
+                    sub_review.append({**sq, 'user_answer': ua, 'is_correct': ua == sq['correct']})
+                sim_review.append({**sim, 'sub_questions': sub_review})
 
-        st.divider()
-        col1, col2 = st.columns([3, 1])
+            st.session_state.mock_result = {
+                **result,
+                'elapsed': elapsed_final,
+                'mcq_per_question': mcq_per_question,
+                'sim_review': sim_review,
+            }
+            st.session_state.mock_screen = "results"
+            st.rerun()
 
-        with col1:
-            btn_label = "Next Question →" if idx < total - 1 else "Submit Test ✓"
-            btn_type  = "secondary" if idx < total - 1 else "primary"
+        # ── PHASE 1: MCQs ─────────────────────────────────────────────────────
+        if idx < total_mcqs:
+            q = questions[idx]
 
-            if st.button(btn_label, use_container_width=True, type=btn_type):
-                st.session_state.mock_answers[q['mcq_id']] = selected_letter
+            st.progress(idx / total_items if total_items else 0)
+            st.caption(f"MCQ {idx + 1} of {total_mcqs} | Elapsed: {elapsed_str}")
 
-                if idx < total - 1:
-                    st.session_state.mock_idx += 1
-                    st.rerun()
+            diff_badge = {"easy": "🟢 Easy", "medium": "🟡 Medium", "hard": "🔴 Hard"}.get(
+                q['difficulty'], "🔴 Hard"
+            )
+            st.markdown(f"**{q['subject']} › {q['chapter']}** | {diff_badge}")
+            st.subheader(f"Q{idx + 1}. {q['question']}")
+
+            opts = q['options']
+            option_labels = [f"{k}) {v}" for k, v in sorted(opts.items())]
+            choice = st.radio("Select your answer:", option_labels, key=f"mock_radio_{idx}")
+            selected_letter = choice[0]
+
+            st.divider()
+            col1, col2 = st.columns([3, 1])
+
+            with col1:
+                is_last_mcq = (idx == total_mcqs - 1)
+                if not is_last_mcq:
+                    btn_label, btn_type = "Next Question →", "secondary"
+                elif total_sims > 0:
+                    btn_label, btn_type = "Continue to Simulations →", "primary"
                 else:
-                    # Last question — finalize
-                    elapsed_final = int(time.time() - st.session_state.mock_start_time)
-                    earned, max_score, pct, is_proficient = save_mock_test(
-                        st.session_state.mock_subject,
-                        questions,
-                        st.session_state.mock_answers,
-                        elapsed_final
-                    )
-                    per_question = []
-                    for qs in questions:
-                        ua = st.session_state.mock_answers.get(qs['mcq_id'])
-                        per_question.append({**qs, 'user_answer': ua, 'is_correct': ua == qs['correct']})
+                    btn_label, btn_type = "Submit Test ✓", "primary"
 
-                    st.session_state.mock_result = {
-                        'earned': earned, 'max_score': max_score, 'pct': pct,
-                        'is_proficient': is_proficient, 'elapsed': elapsed_final,
-                        'per_question': per_question
-                    }
-                    st.session_state.mock_screen = "results"
-                    st.rerun()
+                if st.button(btn_label, use_container_width=True, type=btn_type):
+                    st.session_state.mock_answers[q['mcq_id']] = selected_letter
 
-        with col2:
-            if st.button("Submit Early", use_container_width=True):
-                st.session_state.mock_answers[q['mcq_id']] = selected_letter
-                elapsed_final = int(time.time() - st.session_state.mock_start_time)
-                questions_done = questions[:idx + 1]
-                earned, max_score, pct, is_proficient = save_mock_test(
-                    st.session_state.mock_subject,
-                    questions_done,
-                    st.session_state.mock_answers,
-                    elapsed_final
+                    if not is_last_mcq:
+                        st.session_state.mock_idx += 1
+                        st.rerun()
+                    elif total_sims > 0:
+                        st.session_state.mock_idx += 1
+                        st.rerun()
+                    else:
+                        _finalize_exam(questions, sims)
+
+            with col2:
+                if st.button("Submit Early", use_container_width=True):
+                    st.session_state.mock_answers[q['mcq_id']] = selected_letter
+                    _finalize_exam(questions[:idx + 1], [])
+
+        # ── PHASE 2: SIMULATIONS ──────────────────────────────────────────────
+        elif sim_idx < total_sims:
+            sim = sims[sim_idx]
+
+            st.progress((total_mcqs + sim_idx) / total_items if total_items else 0)
+            st.caption(f"Simulation {sim_idx + 1} of {total_sims} | Elapsed: {elapsed_str}")
+
+            st.markdown(f"**{sim['subject']} › {sim['chapter']}**")
+            st.subheader(sim['title'])
+            st.markdown(sim['scenario'])
+
+            st.divider()
+            sim_choices = {}
+            for i, sq in enumerate(sim['sub_questions'], 1):
+                st.markdown(f"**Sub-question {i}: {sq['question']}**")
+                opts = sq['options']
+                option_labels = [f"{k}) {v}" for k, v in sorted(opts.items())]
+                choice = st.radio(
+                    "Select your answer:", option_labels,
+                    key=f"sim_radio_{sim_idx}_{sq['id']}"
                 )
-                per_question = []
-                for qs in questions_done:
-                    ua = st.session_state.mock_answers.get(qs['mcq_id'])
-                    per_question.append({**qs, 'user_answer': ua, 'is_correct': ua == qs['correct']})
+                sim_choices[sq['id']] = choice[0]
+                st.markdown("")
 
-                st.session_state.mock_result = {
-                    'earned': earned, 'max_score': max_score, 'pct': pct,
-                    'is_proficient': is_proficient, 'elapsed': elapsed_final,
-                    'per_question': per_question
-                }
-                st.session_state.mock_screen = "results"
-                st.rerun()
+            st.divider()
+            col1, col2 = st.columns([3, 1])
+
+            with col1:
+                is_last_sim = (sim_idx == total_sims - 1)
+                btn_label = "Submit Test ✓" if is_last_sim else "Submit & Next Simulation →"
+
+                if st.button(btn_label, use_container_width=True, type="primary"):
+                    st.session_state.mock_sim_answers.update(sim_choices)
+
+                    if not is_last_sim:
+                        st.session_state.mock_sim_idx += 1
+                        st.rerun()
+                    else:
+                        _finalize_exam(questions, sims)
+
+            with col2:
+                if st.button("Submit Early", use_container_width=True):
+                    st.session_state.mock_sim_answers.update(sim_choices)
+                    _finalize_exam(questions, sims[:sim_idx + 1])
 
     # ── RESULTS SCREEN ────────────────────────────────────────────────────────
     elif screen == "results":
-        result = st.session_state.mock_result
-        earned      = result['earned']
-        max_score   = result['max_score']
-        pct         = result['pct']
+        result      = st.session_state.mock_result
+        mcq_pct     = result['mcq_pct']
+        sim_pct     = result['sim_pct']
+        overall_pct = result['overall_pct']
         proficient  = result['is_proficient']
         elapsed     = result['elapsed']
-        per_q       = result['per_question']
+        mcq_per_q   = result['mcq_per_question']
+        sim_review  = result['sim_review']
 
         mins, secs = divmod(elapsed, 60)
 
-        too_small = len(per_q) < MOCK_TEST_MIN_QUESTIONS
+        too_few_mcqs = result['mcq_total'] < CPA_EXAM_MIN_MCQS
+        too_few_sims = len(sim_review) < CPA_EXAM_MIN_SIMS
+
         if proficient:
-            st.success(f"## ✅ PROFICIENT — {pct}% (≥75% threshold met)")
-        elif too_small:
+            st.success(f"## ✅ PROFICIENT — {overall_pct}% overall (≥75% threshold met)")
+        elif too_few_mcqs or too_few_sims:
+            reasons = []
+            if too_few_mcqs:
+                reasons.append(f"only {result['mcq_total']} MCQs (minimum {CPA_EXAM_MIN_MCQS})")
+            if too_few_sims:
+                reasons.append(f"only {len(sim_review)} simulations (minimum {CPA_EXAM_MIN_SIMS})")
             st.warning(
-                f"## ⚠️ Score: {pct}% — Proficiency not assessed\n\n"
-                f"This test had only **{len(per_q)} questions** (minimum {MOCK_TEST_MIN_QUESTIONS} required). "
-                f"Complete a full {MOCK_TEST_MIN_QUESTIONS}-question mock test to receive a proficiency verdict."
+                f"## ⚠️ Score: {overall_pct}% — Proficiency not assessed\n\n"
+                f"This exam had {' and '.join(reasons)}. "
+                "Complete a full exam to receive a proficiency verdict."
             )
         else:
-            st.error(f"## ❌ Not Yet Proficient — {pct}% (need 75%)")
+            st.error(f"## ❌ Not Yet Proficient — {overall_pct}% overall (need 75%)")
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Weighted Score", f"{earned} / {max_score}")
-        m2.metric("Percentage", f"{pct}%")
-        m3.metric("Time Taken", f"{mins}m {secs}s")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("MCQ Score", f"{mcq_pct}%")
+        m2.metric("Simulation Score", f"{sim_pct}%")
+        m3.metric("Overall Score", f"{overall_pct}%")
+        m4.metric("Time Taken", f"{mins}m {secs}s")
 
-        # Difficulty breakdown
+        # MCQ difficulty breakdown
         st.divider()
-        st.subheader("Breakdown by Difficulty")
+        st.subheader("MCQ Section — Breakdown by Difficulty")
 
         breakdown = {}
-        for q in per_q:
+        for q in mcq_per_q:
             d = q['difficulty']
             if d not in breakdown:
                 breakdown[d] = {'total': 0, 'correct': 0, 'pts_earned': 0, 'pts_max': 0}
@@ -801,14 +626,32 @@ with tab4:
         if table_rows:
             st.table(table_rows)
 
-        # Per-question review
+        # Simulation breakdown
+        if sim_review:
+            st.divider()
+            st.subheader("Simulation Section — Breakdown by Case")
+            sim_table_rows = []
+            for sim in sim_review:
+                subqs = sim['sub_questions']
+                correct_n = sum(1 for sq in subqs if sq['is_correct'])
+                acc = round(correct_n / len(subqs) * 100) if subqs else 0
+                sim_table_rows.append({
+                    "Simulation": sim['title'],
+                    "Chapter":    f"{sim['subject']} › {sim['chapter']}",
+                    "Sub-Qs":     len(subqs),
+                    "Correct":    correct_n,
+                    "Accuracy":   f"{acc}%",
+                })
+            st.table(sim_table_rows)
+
+        # Review
         st.divider()
         with st.expander("📋 Review All Answers"):
-            for i, q in enumerate(per_q, 1):
+            st.markdown("### MCQ Section")
+            for i, q in enumerate(mcq_per_q, 1):
                 ua  = q['user_answer'] or "—"
                 correct_ans = q['correct']
-                icon = "✅" if q['is_correct'] else "❌"
-                diff_label = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(q['difficulty'], "🟡")
+                diff_label = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(q['difficulty'], "🔴")
 
                 st.markdown(f"**{i}. {diff_label} {q['question']}**")
                 opts = q['options']
@@ -824,6 +667,29 @@ with tab4:
                         st.markdown(f"&nbsp;&nbsp;&nbsp;{letter}) {val}")
                 st.caption(f"**Explanation:** {q['explanation']}")
                 st.divider()
+
+            if sim_review:
+                st.markdown("### Simulation Section")
+                for s_i, sim in enumerate(sim_review, 1):
+                    st.markdown(f"#### {s_i}. {sim['title']} ({sim['subject']} › {sim['chapter']})")
+                    st.markdown(sim['scenario'])
+                    for sq_i, sq in enumerate(sim['sub_questions'], 1):
+                        ua = sq['user_answer'] or "—"
+                        correct_ans = sq['correct']
+                        st.markdown(f"**{s_i}.{sq_i}. {sq['question']}**")
+                        opts = sq['options']
+                        for letter in ['A', 'B', 'C', 'D']:
+                            val = opts.get(letter, '')
+                            if letter == correct_ans and letter == ua:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;**✅ {letter}) {val}** ← your answer (correct)")
+                            elif letter == correct_ans:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;**✅ {letter}) {val}** ← correct answer")
+                            elif letter == ua:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;**❌ {letter}) {val}** ← your answer")
+                            else:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;{letter}) {val}")
+                        st.caption(f"**Explanation:** {sq['explanation']}")
+                    st.divider()
 
         if st.button("🔁 Start New Test", type="primary"):
             st.session_state.mock_screen = "setup"

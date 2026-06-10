@@ -11,6 +11,7 @@ env/
 
 # Environment / secrets — NEVER commit real keys
 .env
+.streamlit/secrets.toml
 
 # SQLite database (user data, not source)
 *.db

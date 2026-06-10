@@ -1,124 +1,68 @@
-import sqlite3
+import os
 import datetime
 import json
 import random
+import re
 
-DB_NAME = "ca_practice.db"
+import psycopg2
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DIFFICULTY_POINTS = {'easy': 1, 'medium': 2, 'hard': 3}
-MOCK_TEST_MIN_QUESTIONS = 50  # Minimum questions for a valid proficiency assessment
+CPA_EXAM_MIN_MCQS = 50  # Minimum MCQs for a valid proficiency assessment
+CPA_EXAM_MIN_SIMS = 5   # Minimum simulations for a valid proficiency assessment
 
 
 def _norm_q(text: str) -> str:
     """Normalised question key used for duplicate detection."""
-    import re
     return re.sub(r'\s+', ' ', (text or "").lower().strip())
 
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+def _get_db_url():
+    try:
+        import streamlit as st
+        if "SUPABASE_DB_URL" in st.secrets:
+            return st.secrets["SUPABASE_DB_URL"]
+    except Exception:
+        pass
+    return os.environ["SUPABASE_DB_URL"]
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS subjects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
-        )
-    ''')
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS chapters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject_id INTEGER,
-            name TEXT NOT NULL,
-            UNIQUE(subject_id, name),
-            FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
-        )
-    ''')
+_conn = None
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS mcqs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chapter_id INTEGER,
-            question TEXT NOT NULL,
-            options TEXT NOT NULL,
-            correct_option TEXT NOT NULL,
-            explanation TEXT,
-            difficulty TEXT DEFAULT 'medium',
-            is_retired INTEGER DEFAULT 0,
-            FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
-        )
-    ''')
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS srs_states (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            mcq_id INTEGER UNIQUE,
-            repetitions INTEGER DEFAULT 0,
-            interval INTEGER DEFAULT 0,
-            ease_factor REAL DEFAULT 2.5,
-            next_review TEXT NOT NULL,
-            FOREIGN KEY(mcq_id) REFERENCES mcqs(id) ON DELETE CASCADE
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS mock_tests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject_id INTEGER,
-            taken_at TEXT NOT NULL,
-            total_questions INTEGER,
-            earned_score REAL,
-            max_score REAL,
-            percentage REAL,
-            is_proficient INTEGER,
-            time_taken_seconds INTEGER,
-            FOREIGN KEY(subject_id) REFERENCES subjects(id)
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS mock_test_answers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            test_id INTEGER NOT NULL,
-            mcq_id INTEGER,
-            selected_option TEXT,
-            is_correct INTEGER,
-            difficulty TEXT,
-            FOREIGN KEY(test_id) REFERENCES mock_tests(id)
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS practice_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            mcq_id INTEGER,
-            reviewed_at TEXT NOT NULL,
-            time_spent_seconds REAL DEFAULT 0,
-            srs_rating INTEGER,
-            attempts INTEGER DEFAULT 1,
-            FOREIGN KEY(mcq_id) REFERENCES mcqs(id) ON DELETE CASCADE
-        )
-    ''')
-
-    conn.commit()
-    conn.close()
+def _get_conn():
+    global _conn
+    if _conn is not None:
+        try:
+            with _conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return _conn
+        except psycopg2.Error:
+            _conn = None
+    _conn = psycopg2.connect(_get_db_url())
+    _conn.autocommit = True
+    return _conn
 
 
 def save_generated_mcqs(subject_name, chapter_name, mcq_list):
-    conn = sqlite3.connect(DB_NAME)
+    conn = _get_conn()
     cursor = conn.cursor()
 
-    cursor.execute("INSERT OR IGNORE INTO subjects (name) VALUES (?)", (subject_name,))
-    cursor.execute("SELECT id FROM subjects WHERE name = ?", (subject_name,))
+    cursor.execute("INSERT INTO subjects (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (subject_name,))
+    cursor.execute("SELECT id FROM subjects WHERE name = %s", (subject_name,))
     subject_id = cursor.fetchone()[0]
 
-    cursor.execute("INSERT OR IGNORE INTO chapters (subject_id, name) VALUES (?, ?)", (subject_id, chapter_name))
-    cursor.execute("SELECT id FROM chapters WHERE subject_id = ? AND name = ?", (subject_id, chapter_name))
+    cursor.execute(
+        "INSERT INTO chapters (subject_id, name) VALUES (%s, %s) ON CONFLICT (subject_id, name) DO NOTHING",
+        (subject_id, chapter_name)
+    )
+    cursor.execute("SELECT id FROM chapters WHERE subject_id = %s AND name = %s", (subject_id, chapter_name))
     chapter_id = cursor.fetchone()[0]
 
     # Load existing normalised question texts for this chapter to skip duplicates
-    cursor.execute("SELECT question FROM mcqs WHERE chapter_id = ?", (chapter_id,))
+    cursor.execute("SELECT question FROM mcqs WHERE chapter_id = %s", (chapter_id,))
     existing_keys = {_norm_q(r[0]) for r in cursor.fetchall()}
 
     added = 0
@@ -139,26 +83,135 @@ def save_generated_mcqs(subject_name, chapter_name, mcq_list):
 
         cursor.execute('''
             INSERT INTO mcqs (chapter_id, question, options, correct_option, explanation, difficulty)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
         ''', (chapter_id, item['question'], json.dumps(options_dict),
               correct_option, item['explanation'], difficulty))
 
-        mcq_id = cursor.lastrowid
-        today_str = datetime.date.today().isoformat()
-        cursor.execute('INSERT INTO srs_states (mcq_id, next_review) VALUES (?, ?)', (mcq_id, today_str))
+        mcq_id = cursor.fetchone()[0]
+        cursor.execute('INSERT INTO srs_states (mcq_id, next_review) VALUES (%s, %s)',
+                        (mcq_id, datetime.date.today()))
         added += 1
 
     conn.commit()
-    conn.close()
+    cursor.close()
+    return added
+
+
+def save_generated_mock_mcqs(subject_name, chapter_name, mcq_list):
+    """Mirrors save_generated_mcqs but inserts into the separate mock_mcqs pool (no SRS state)."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute("INSERT INTO subjects (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (subject_name,))
+    cursor.execute("SELECT id FROM subjects WHERE name = %s", (subject_name,))
+    subject_id = cursor.fetchone()[0]
+
+    cursor.execute(
+        "INSERT INTO chapters (subject_id, name) VALUES (%s, %s) ON CONFLICT (subject_id, name) DO NOTHING",
+        (subject_id, chapter_name)
+    )
+    cursor.execute("SELECT id FROM chapters WHERE subject_id = %s AND name = %s", (subject_id, chapter_name))
+    chapter_id = cursor.fetchone()[0]
+
+    # Dedup against both the practice bank and the existing mock pool for this chapter
+    cursor.execute("SELECT question FROM mcqs WHERE chapter_id = %s", (chapter_id,))
+    existing_keys = {_norm_q(r[0]) for r in cursor.fetchall()}
+    cursor.execute("SELECT question FROM mock_mcqs WHERE chapter_id = %s", (chapter_id,))
+    existing_keys |= {_norm_q(r[0]) for r in cursor.fetchall()}
+
+    added = 0
+    for item in mcq_list:
+        nk = _norm_q(item['question'])
+        if nk in existing_keys:
+            continue  # duplicate — skip
+        existing_keys.add(nk)
+
+        # Shuffle option letters so the correct answer is not always in the same position
+        letters = ['A', 'B', 'C', 'D']
+        texts = [item['option_A'], item['option_B'], item['option_C'], item['option_D']]
+        original_correct_text = item[f"option_{item['correct_option']}"]
+        random.shuffle(texts)
+        options_dict = dict(zip(letters, texts))
+        correct_option = next(k for k, v in options_dict.items() if v == original_correct_text)
+        difficulty = item.get('difficulty', 'hard')
+
+        cursor.execute('''
+            INSERT INTO mock_mcqs (chapter_id, question, options, correct_option, explanation, difficulty)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (chapter_id, item['question'], json.dumps(options_dict),
+              correct_option, item['explanation'], difficulty))
+        added += 1
+
+    conn.commit()
+    cursor.close()
+    return added
+
+
+def save_generated_simulations(subject_name, chapter_name, sim_list):
+    """Inserts simulations and their MCQ sub-questions into simulations / simulation_questions."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute("INSERT INTO subjects (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (subject_name,))
+    cursor.execute("SELECT id FROM subjects WHERE name = %s", (subject_name,))
+    subject_id = cursor.fetchone()[0]
+
+    cursor.execute(
+        "INSERT INTO chapters (subject_id, name) VALUES (%s, %s) ON CONFLICT (subject_id, name) DO NOTHING",
+        (subject_id, chapter_name)
+    )
+    cursor.execute("SELECT id FROM chapters WHERE subject_id = %s AND name = %s", (subject_id, chapter_name))
+    chapter_id = cursor.fetchone()[0]
+
+    cursor.execute("SELECT title FROM simulations WHERE chapter_id = %s", (chapter_id,))
+    existing_titles = {_norm_q(r[0]) for r in cursor.fetchall()}
+
+    added = 0
+    for sim in sim_list:
+        nk = _norm_q(sim['title'])
+        if nk in existing_titles:
+            continue  # duplicate — skip
+        existing_titles.add(nk)
+
+        cursor.execute('''
+            INSERT INTO simulations (chapter_id, title, scenario, difficulty)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+        ''', (chapter_id, sim['title'], sim['scenario'], 'hard'))
+        sim_id = cursor.fetchone()[0]
+
+        for seq_no, sub in enumerate(sim['sub_questions'], start=1):
+            letters = ['A', 'B', 'C', 'D']
+            texts = [sub['option_A'], sub['option_B'], sub['option_C'], sub['option_D']]
+            original_correct_text = sub[f"option_{sub['correct_option']}"]
+            random.shuffle(texts)
+            options_dict = dict(zip(letters, texts))
+            correct_option = next(k for k, v in options_dict.items() if v == original_correct_text)
+
+            cursor.execute('''
+                INSERT INTO simulation_questions
+                    (simulation_id, seq_no, question, options, correct_option, explanation)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            ''', (sim_id, seq_no, sub['question'], json.dumps(options_dict),
+                  correct_option, sub['explanation']))
+
+        added += 1
+
+    conn.commit()
+    cursor.close()
     return added
 
 
 def update_srs_item(mcq_id, q, time_spent_seconds=0, attempts=1):
-    conn = sqlite3.connect(DB_NAME)
+    conn = _get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT repetitions, interval, ease_factor FROM srs_states WHERE mcq_id = ?", (mcq_id,))
+    cursor.execute("SELECT repetitions, interval, ease_factor FROM srs_states WHERE mcq_id = %s", (mcq_id,))
     row = cursor.fetchone()
     repetitions, interval, ease_factor = row if row else (0, 0, 2.5)
+    repetitions = int(repetitions)
+    interval = int(interval)
+    ease_factor = float(ease_factor)
 
     if q < 3:
         new_repetitions, new_interval = 0, 1
@@ -169,47 +222,129 @@ def update_srs_item(mcq_id, q, time_spent_seconds=0, attempts=1):
         else:                      new_interval = int(round(interval * ease_factor))
 
     new_ease_factor = max(ease_factor + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02)), 1.3)
-    next_date = (datetime.date.today() + datetime.timedelta(days=new_interval)).isoformat()
+    next_date = datetime.date.today() + datetime.timedelta(days=new_interval)
 
     cursor.execute('''
-        UPDATE srs_states SET repetitions = ?, interval = ?, ease_factor = ?, next_review = ?
-        WHERE mcq_id = ?
+        UPDATE srs_states SET repetitions = %s, interval = %s, ease_factor = %s, next_review = %s
+        WHERE mcq_id = %s
     ''', (new_repetitions, new_interval, round(new_ease_factor, 2), next_date, mcq_id))
 
     cursor.execute('''
         INSERT INTO practice_log (mcq_id, reviewed_at, time_spent_seconds, srs_rating, attempts)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (mcq_id, datetime.date.today().isoformat(), time_spent_seconds, q, attempts))
+        VALUES (%s, %s, %s, %s, %s)
+    ''', (mcq_id, datetime.date.today(), time_spent_seconds, q, attempts))
 
     conn.commit()
-    conn.close()
+    cursor.close()
 
 
-def get_mock_test_questions(subject_name, count):
+def get_subject_list():
+    """Returns a sorted list of all subject names."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM subjects ORDER BY name")
+    names = [r[0] for r in cursor.fetchall()]
+    cursor.close()
+    return names
+
+
+def get_due_mcqs(subject_name, test_mode):
     """
-    Returns up to `count` MCQs balanced by difficulty (30% easy, 40% medium, 30% hard).
-    Falls back to any available questions if a difficulty bucket is too small.
+    Returns active (non-retired) MCQs for the practice deck.
+    If test_mode is True, ignores SRS due dates and orders by repetitions/next_review
+    so weakest cards surface first. Otherwise only returns cards due today or earlier.
+    Row shape: (id, question, options, correct_option, explanation, chapter_name, subject_name)
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = _get_conn()
     cursor = conn.cursor()
 
-    base_query = '''
-        SELECT m.id, m.question, m.options, m.correct_option, m.explanation,
-               COALESCE(m.difficulty, 'medium') as difficulty, c.name, sub.name
+    query = '''
+        SELECT m.id, m.question, m.options, m.correct_option, m.explanation, c.name, sub.name
         FROM mcqs m
+        JOIN srs_states s ON m.id = s.mcq_id
         JOIN chapters c ON m.chapter_id = c.id
         JOIN subjects sub ON c.subject_id = sub.id
         WHERE m.is_retired = 0
     '''
     params = []
     if subject_name != "All Subjects":
-        base_query += " AND sub.name = ?"
+        query += " AND sub.name = %s"
         params.append(subject_name)
 
-    easy   = cursor.execute(base_query + " AND COALESCE(m.difficulty,'medium') = 'easy'",   params).fetchall()
-    medium = cursor.execute(base_query + " AND COALESCE(m.difficulty,'medium') = 'medium'", params).fetchall()
-    hard   = cursor.execute(base_query + " AND COALESCE(m.difficulty,'medium') = 'hard'",   params).fetchall()
-    conn.close()
+    if test_mode:
+        query += " ORDER BY s.repetitions ASC, s.next_review ASC"
+    else:
+        query += " AND s.next_review <= %s ORDER BY s.next_review ASC"
+        params.append(datetime.date.today())
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+def get_cpa_exam_availability(subject_name):
+    """Returns (mock_mcq_count, distinct_chapters_with_sims, total_sims) for the exam setup screen."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    mcq_query = '''
+        SELECT COUNT(*) FROM mock_mcqs m
+        JOIN chapters c ON m.chapter_id = c.id
+        JOIN subjects sub ON c.subject_id = sub.id
+        WHERE m.is_retired = 0
+    '''
+    sim_query = '''
+        SELECT COUNT(DISTINCT s.chapter_id), COUNT(*) FROM simulations s
+        JOIN chapters c ON s.chapter_id = c.id
+        JOIN subjects sub ON c.subject_id = sub.id
+        WHERE s.is_retired = 0
+    '''
+    params = []
+    if subject_name != "All Subjects":
+        mcq_query += " AND sub.name = %s"
+        sim_query += " AND sub.name = %s"
+        params.append(subject_name)
+
+    cursor.execute(mcq_query, params)
+    mock_mcq_count = cursor.fetchone()[0]
+
+    cursor.execute(sim_query, params)
+    distinct_chapters_with_sims, total_sims = cursor.fetchone()
+
+    cursor.close()
+    return mock_mcq_count, distinct_chapters_with_sims, total_sims
+
+
+def get_cpa_exam_mcqs(subject_name, count):
+    """
+    Returns up to `count` MCQs from the mock-exam pool, balanced by difficulty
+    (30% easy, 40% medium, 30% hard). Falls back to any available questions if
+    a difficulty bucket is too small.
+    """
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    base_query = '''
+        SELECT m.id, m.question, m.options, m.correct_option, m.explanation,
+               COALESCE(m.difficulty, 'hard') as difficulty, c.name, sub.name
+        FROM mock_mcqs m
+        JOIN chapters c ON m.chapter_id = c.id
+        JOIN subjects sub ON c.subject_id = sub.id
+        WHERE m.is_retired = 0
+    '''
+    params = []
+    if subject_name != "All Subjects":
+        base_query += " AND sub.name = %s"
+        params.append(subject_name)
+
+    cursor.execute(base_query + " AND COALESCE(m.difficulty,'hard') = 'easy'", params)
+    easy = cursor.fetchall()
+    cursor.execute(base_query + " AND COALESCE(m.difficulty,'hard') = 'medium'", params)
+    medium = cursor.fetchall()
+    cursor.execute(base_query + " AND COALESCE(m.difficulty,'hard') = 'hard'", params)
+    hard = cursor.fetchall()
+    cursor.close()
 
     n_easy   = max(1, round(count * 0.30))
     n_medium = max(1, round(count * 0.40))
@@ -244,73 +379,189 @@ def get_mock_test_questions(subject_name, count):
     return result
 
 
-def save_mock_test(subject_name, questions, answers, time_taken_seconds):
+def get_cpa_exam_simulations(subject_name):
     """
-    Persists mock test results and returns (earned_score, max_score, percentage, is_proficient).
-    Scoring: easy=1pt, medium=2pts, hard=3pts. Proficient if percentage >= 75.
+    Selects target_n = min(7, max(5, n_available_chapters)) chapters with
+    simulations (random, capped by availability), one random non-retired
+    simulation per chosen chapter, each with its ordered sub_questions.
     """
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    query = '''
+        SELECT DISTINCT s.chapter_id
+        FROM simulations s
+        JOIN chapters c ON s.chapter_id = c.id
+        JOIN subjects sub ON c.subject_id = sub.id
+        WHERE s.is_retired = 0
+    '''
+    params = []
+    if subject_name != "All Subjects":
+        query += " AND sub.name = %s"
+        params.append(subject_name)
+
+    cursor.execute(query, params)
+    chapter_ids = [r[0] for r in cursor.fetchall()]
+
+    if not chapter_ids:
+        cursor.close()
+        return []
+
+    target_n = min(7, max(5, len(chapter_ids)))
+    chosen_chapters = random.sample(chapter_ids, min(target_n, len(chapter_ids)))
+
+    simulations = []
+    for chapter_id in chosen_chapters:
+        cursor.execute('''
+            SELECT s.id, s.title, s.scenario, c.name, sub.name
+            FROM simulations s
+            JOIN chapters c ON s.chapter_id = c.id
+            JOIN subjects sub ON c.subject_id = sub.id
+            WHERE s.chapter_id = %s AND s.is_retired = 0
+        ''', (chapter_id,))
+        candidates = cursor.fetchall()
+        if not candidates:
+            continue
+        sim_id, title, scenario, chapter_name, subject_name_row = random.choice(candidates)
+
+        cursor.execute('''
+            SELECT id, question, options, correct_option, explanation
+            FROM simulation_questions
+            WHERE simulation_id = %s
+            ORDER BY seq_no
+        ''', (sim_id,))
+        sub_questions = []
+        for sq_id, question, options_json, correct, explanation in cursor.fetchall():
+            sub_questions.append({
+                'id':          sq_id,
+                'question':    question,
+                'options':     json.loads(options_json),
+                'correct':     correct,
+                'explanation': explanation,
+            })
+
+        simulations.append({
+            'simulation_id': sim_id,
+            'title':         title,
+            'scenario':      scenario,
+            'chapter':       chapter_name,
+            'subject':       subject_name_row,
+            'sub_questions': sub_questions,
+        })
+
+    cursor.close()
+    return simulations
+
+
+def save_cpa_exam(subject_name, mcq_questions, mcq_answers, simulations, sim_answers, time_taken_seconds):
+    """
+    Persists a CPA simulation exam attempt and returns a result dict with
+    mcq_pct, sim_pct, overall_pct, and is_proficient.
+
+    mcq_questions : list from get_cpa_exam_mcqs
+    mcq_answers   : dict {mcq_id: selected_option}
+    simulations   : list from get_cpa_exam_simulations
+    sim_answers   : dict {simulation_question_id: selected_option}
+
+    MCQ scoring is difficulty-weighted (easy=1pt, medium=2pts, hard=3pts);
+    simulation scoring is a simple correct/total ratio across all sub-questions.
+    overall_pct = (mcq_pct + sim_pct) / 2. Proficient if overall_pct >= 75 AND
+    minimum item-count gates (CPA_EXAM_MIN_MCQS, CPA_EXAM_MIN_SIMS) are met.
+    """
+    conn = _get_conn()
+    cursor = conn.cursor()
+
     subject_id = None
     if subject_name != "All Subjects":
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM subjects WHERE name = ?", (subject_name,))
+        cursor.execute("SELECT id FROM subjects WHERE name = %s", (subject_name,))
         row = cursor.fetchone()
         subject_id = row[0] if row else None
-        conn.close()
 
-    earned = 0
-    max_score = 0
+    mcq_earned = 0
+    mcq_max = 0
+    mcq_correct_count = 0
     answer_rows = []
 
-    for q in questions:
+    for q in mcq_questions:
         pts = DIFFICULTY_POINTS.get(q['difficulty'], 2)
-        max_score += pts
-        user_ans = answers.get(q['mcq_id'])
+        mcq_max += pts
+        user_ans = mcq_answers.get(q['mcq_id'])
         is_correct = 1 if user_ans == q['correct'] else 0
         if is_correct:
-            earned += pts
-        answer_rows.append((q['mcq_id'], user_ans, is_correct, q['difficulty']))
+            mcq_earned += pts
+            mcq_correct_count += 1
+        answer_rows.append(('mcq', q['mcq_id'], user_ans, is_correct, q['difficulty']))
 
-    pct = round((earned / max_score * 100), 1) if max_score > 0 else 0.0
-    is_proficient = 1 if (pct >= 75 and len(questions) >= MOCK_TEST_MIN_QUESTIONS) else 0
+    mcq_total = len(mcq_questions)
+    mcq_pct = round((mcq_earned / mcq_max * 100), 1) if mcq_max > 0 else 0.0
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    sim_total = 0
+    sim_correct = 0
+
+    for sim in simulations:
+        for sq in sim['sub_questions']:
+            sim_total += 1
+            user_ans = sim_answers.get(sq['id'])
+            is_correct = 1 if user_ans == sq['correct'] else 0
+            if is_correct:
+                sim_correct += 1
+            answer_rows.append(('sim', sq['id'], user_ans, is_correct, 'hard'))
+
+    sim_pct = round((sim_correct / sim_total * 100), 1) if sim_total > 0 else 0.0
+
+    overall_pct = round((mcq_pct + sim_pct) / 2, 1)
+    is_proficient = 1 if (
+        overall_pct >= 75
+        and mcq_total >= CPA_EXAM_MIN_MCQS
+        and len(simulations) >= CPA_EXAM_MIN_SIMS
+    ) else 0
+
     cursor.execute('''
-        INSERT INTO mock_tests
-            (subject_id, taken_at, total_questions, earned_score, max_score, percentage, is_proficient, time_taken_seconds)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (subject_id, datetime.date.today().isoformat(), len(questions),
-          earned, max_score, pct, is_proficient, time_taken_seconds))
+        INSERT INTO cpa_exams
+            (subject_id, taken_at, mcq_total, mcq_correct, mcq_pct,
+             sim_total, sim_correct, sim_pct, overall_pct, is_proficient, time_taken_seconds)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    ''', (subject_id, datetime.date.today(), mcq_total, mcq_correct_count, mcq_pct,
+          sim_total, sim_correct, sim_pct, overall_pct, is_proficient, time_taken_seconds))
 
-    test_id = cursor.lastrowid
-    for mcq_id, selected_option, is_correct, difficulty in answer_rows:
+    exam_id = cursor.fetchone()[0]
+    for item_type, item_id, selected_option, is_correct, difficulty in answer_rows:
         cursor.execute('''
-            INSERT INTO mock_test_answers (test_id, mcq_id, selected_option, is_correct, difficulty)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (test_id, mcq_id, selected_option, is_correct, difficulty))
+            INSERT INTO cpa_exam_answers (exam_id, item_type, item_id, selected_option, is_correct, difficulty)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (exam_id, item_type, item_id, selected_option, is_correct, difficulty))
 
     conn.commit()
-    conn.close()
+    cursor.close()
 
-    return earned, max_score, pct, bool(is_proficient)
+    return {
+        'mcq_total':     mcq_total,
+        'mcq_correct':   mcq_correct_count,
+        'mcq_pct':       mcq_pct,
+        'sim_total':     sim_total,
+        'sim_correct':   sim_correct,
+        'sim_pct':       sim_pct,
+        'overall_pct':   overall_pct,
+        'is_proficient': bool(is_proficient),
+    }
 
 
-def get_mock_test_history(limit=10):
-    """Returns recent mock test rows: (id, subject, date, total_q, earned, max, pct, is_proficient, seconds)."""
-    conn = sqlite3.connect(DB_NAME)
+def get_cpa_exam_history(limit=10):
+    """Returns recent CPA exam rows: (id, subject, date, mcq_pct, sim_pct, overall_pct, is_proficient, mcq_total, sim_total, seconds)."""
+    conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT mt.id, COALESCE(sub.name, 'All Subjects'), mt.taken_at,
-               mt.total_questions, mt.earned_score, mt.max_score,
-               mt.percentage, mt.is_proficient, mt.time_taken_seconds
-        FROM mock_tests mt
-        LEFT JOIN subjects sub ON mt.subject_id = sub.id
-        ORDER BY mt.taken_at DESC
-        LIMIT ?
+        SELECT ce.id, COALESCE(sub.name, 'All Subjects'), ce.taken_at,
+               ce.mcq_pct, ce.sim_pct, ce.overall_pct, ce.is_proficient,
+               ce.mcq_total, ce.sim_total, ce.time_taken_seconds
+        FROM cpa_exams ce
+        LEFT JOIN subjects sub ON ce.subject_id = sub.id
+        ORDER BY ce.taken_at DESC
+        LIMIT %s
     ''', (limit,))
     rows = cursor.fetchall()
-    conn.close()
+    cursor.close()
     return rows
 
 
@@ -321,11 +572,11 @@ def get_analytics_data():
       stages    : (new_cards, learning, mature)
       subjects  : list of (name, total, easy, medium, hard, due, avg_ease, total_reps)
       weak_chapters : list of (label, avg_ease, count, due)
-      mock_history  : list of (date, subject, pct, is_proficient, total_q, earned, max_score)
+      exam_history  : list of (date, subject, mcq_pct, sim_pct, overall_pct, is_proficient, mcq_total, sim_total)
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = _get_conn()
     cursor = conn.cursor()
-    today = datetime.date.today().isoformat()
+    today = datetime.date.today()
 
     cursor.execute('''
         SELECT
@@ -334,7 +585,7 @@ def get_analytics_data():
             SUM(CASE WHEN COALESCE(m.difficulty,'medium')='medium' THEN 1 ELSE 0 END),
             SUM(CASE WHEN COALESCE(m.difficulty,'medium')='hard'   THEN 1 ELSE 0 END),
             COALESCE(SUM(s.repetitions), 0),
-            SUM(CASE WHEN s.next_review <= ? THEN 1 ELSE 0 END)
+            SUM(CASE WHEN s.next_review <= %s THEN 1 ELSE 0 END)
         FROM mcqs m
         JOIN srs_states s ON s.mcq_id = m.id
         WHERE m.is_retired = 0
@@ -358,7 +609,7 @@ def get_analytics_data():
                SUM(CASE WHEN COALESCE(m.difficulty,'medium')='easy'   THEN 1 ELSE 0 END),
                SUM(CASE WHEN COALESCE(m.difficulty,'medium')='medium' THEN 1 ELSE 0 END),
                SUM(CASE WHEN COALESCE(m.difficulty,'medium')='hard'   THEN 1 ELSE 0 END),
-               SUM(CASE WHEN s.next_review <= ? THEN 1 ELSE 0 END),
+               SUM(CASE WHEN s.next_review <= %s THEN 1 ELSE 0 END),
                ROUND(AVG(s.ease_factor), 2),
                COALESCE(SUM(s.repetitions), 0)
         FROM subjects sub
@@ -375,13 +626,13 @@ def get_analytics_data():
         SELECT sub.name || ' › ' || c.name,
                ROUND(AVG(s.ease_factor), 2),
                COUNT(m.id),
-               SUM(CASE WHEN s.next_review <= ? THEN 1 ELSE 0 END)
+               SUM(CASE WHEN s.next_review <= %s THEN 1 ELSE 0 END)
         FROM chapters c
         JOIN mcqs m ON m.chapter_id = c.id
         JOIN srs_states s ON s.mcq_id = m.id
         JOIN subjects sub ON c.subject_id = sub.id
         WHERE m.is_retired = 0 AND s.repetitions >= 2
-        GROUP BY c.id
+        GROUP BY c.id, sub.name, c.name
         HAVING COUNT(m.id) >= 3
         ORDER BY AVG(s.ease_factor) ASC
         LIMIT 5
@@ -389,21 +640,21 @@ def get_analytics_data():
     weak_chapters = cursor.fetchall()
 
     cursor.execute('''
-        SELECT mt.taken_at, COALESCE(sub.name, 'All Subjects'),
-               mt.percentage, mt.is_proficient, mt.total_questions,
-               mt.earned_score, mt.max_score
-        FROM mock_tests mt
-        LEFT JOIN subjects sub ON mt.subject_id = sub.id
-        ORDER BY mt.taken_at DESC
+        SELECT ce.taken_at, COALESCE(sub.name, 'All Subjects'),
+               ce.mcq_pct, ce.sim_pct, ce.overall_pct, ce.is_proficient,
+               ce.mcq_total, ce.sim_total
+        FROM cpa_exams ce
+        LEFT JOIN subjects sub ON ce.subject_id = sub.id
+        ORDER BY ce.taken_at DESC
         LIMIT 10
     ''')
-    mock_history = cursor.fetchall()
+    exam_history = cursor.fetchall()
 
     # ── Study time ─────────────────────────────────────────────────────────────
     cursor.execute('''
         SELECT
             ROUND(SUM(time_spent_seconds) / 3600.0, 1),
-            ROUND(SUM(CASE WHEN reviewed_at >= date('now','-7 days')
+            ROUND(SUM(CASE WHEN reviewed_at >= CURRENT_DATE - INTERVAL '7 days'
                           THEN time_spent_seconds ELSE 0 END) / 3600.0, 1),
             ROUND(AVG(CASE WHEN time_spent_seconds > 0 THEN time_spent_seconds END) / 60.0, 1)
         FROM practice_log
@@ -426,15 +677,15 @@ def get_analytics_data():
             WHERE {date_filter}
         '''
 
-    cursor.execute(_score_sql("pl.reviewed_at >= date('now','-7 days')"))
+    cursor.execute(_score_sql("pl.reviewed_at >= CURRENT_DATE - INTERVAL '7 days'"))
     current_score = (cursor.fetchone() or (None,))[0] or 0.0
 
     cursor.execute(_score_sql(
-        "pl.reviewed_at >= date('now','-14 days') AND pl.reviewed_at < date('now','-7 days')"
+        "pl.reviewed_at >= CURRENT_DATE - INTERVAL '14 days' AND pl.reviewed_at < CURRENT_DATE - INTERVAL '7 days'"
     ))
     prev_score = (cursor.fetchone() or (None,))[0] or 0.0
 
-    cursor.execute(f'''
+    cursor.execute('''
         SELECT pl.reviewed_at,
             ROUND(
                 SUM(CASE WHEN pl.srs_rating >= 3
@@ -446,11 +697,11 @@ def get_analytics_data():
                     WHEN 'easy' THEN 1.0 WHEN 'hard' THEN 3.0 ELSE 2.0 END), 0)
             , 1)
         FROM practice_log pl JOIN mcqs m ON pl.mcq_id = m.id
-        WHERE pl.reviewed_at >= date('now','-30 days')
+        WHERE pl.reviewed_at >= CURRENT_DATE - INTERVAL '30 days'
         GROUP BY pl.reviewed_at
         ORDER BY pl.reviewed_at
     ''')
-    daily_trend = cursor.fetchall()   # [(date_str, score), ...]
+    daily_trend = [(d.isoformat(), score) for d, score in cursor.fetchall()]
 
     # ── Chapter performance with confidence score ──────────────────────────────
     cursor.execute('''
@@ -459,10 +710,10 @@ def get_analytics_data():
             c.name,
             COUNT(DISTINCT m.id)                      AS total_mcqs,
             ROUND(AVG(s.ease_factor), 2)              AS avg_ease,
-            COALESCE(pl_agg.total_reviews, 0)         AS total_reviews,
-            COALESCE(pl_agg.correct_reviews, 0)       AS correct_reviews,
-            SUM(CASE WHEN s.next_review <= ? THEN 1 ELSE 0 END) AS due_count,
-            COALESCE(pl_agg.total_time_sec, 0)        AS total_time_sec
+            COALESCE(SUM(pl_agg.total_reviews), 0)    AS total_reviews,
+            COALESCE(SUM(pl_agg.correct_reviews), 0)  AS correct_reviews,
+            SUM(CASE WHEN s.next_review <= %s THEN 1 ELSE 0 END) AS due_count,
+            COALESCE(SUM(pl_agg.total_time_sec), 0)   AS total_time_sec
         FROM chapters c
         JOIN subjects sub ON c.subject_id = sub.id
         JOIN mcqs m ON m.chapter_id = c.id
@@ -482,13 +733,13 @@ def get_analytics_data():
     chapter_perf = cursor.fetchall()
     # (subject, chapter, total_mcqs, avg_ease, total_reviews, correct_reviews, due_count, total_time_sec)
 
-    conn.close()
+    cursor.close()
     return {
         'overall':          overall,
         'stages':           stages,
         'subjects':         subjects,
         'weak_chapters':    weak_chapters,
-        'mock_history':     mock_history,
+        'exam_history':     exam_history,
         'study_time':       study_time,
         'trending_current': current_score,
         'trending_prev':    prev_score,
@@ -501,7 +752,7 @@ def get_analytics_data():
 
 def get_question_bank_summary():
     """Returns list of (subject, chapter, mcq_count) sorted by subject, chapter."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute('''
         SELECT sub.name, c.name, COUNT(m.id)
@@ -513,41 +764,75 @@ def get_question_bank_summary():
         ORDER BY sub.name, c.name
     ''')
     rows = cursor.fetchall()
-    conn.close()
+    cursor.close()
     return rows  # [(subject, chapter, count), ...]
 
 
-def delete_chapter_mcqs(subject_name, chapter_name):
-    """Hard-deletes all MCQs (+ SRS states + practice log) for one chapter."""
-    conn = sqlite3.connect(DB_NAME)
+def get_mock_bank_summary():
+    """Returns list of (subject, chapter, mock_mcq_count, sim_count) sorted by subject, chapter."""
+    conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute('''
-        DELETE FROM mcqs WHERE chapter_id = (
-            SELECT c.id FROM chapters c
-            JOIN subjects sub ON c.subject_id = sub.id
-            WHERE sub.name = ? AND c.name = ?
-        )
+        SELECT sub.name, c.name,
+               COUNT(DISTINCT mm.id),
+               COUNT(DISTINCT s.id)
+        FROM subjects sub
+        JOIN chapters c ON c.subject_id = sub.id
+        LEFT JOIN mock_mcqs mm ON mm.chapter_id = c.id AND mm.is_retired = 0
+        LEFT JOIN simulations s ON s.chapter_id = c.id AND s.is_retired = 0
+        GROUP BY sub.name, c.name
+        HAVING COUNT(DISTINCT mm.id) > 0 OR COUNT(DISTINCT s.id) > 0
+        ORDER BY sub.name, c.name
+    ''')
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows  # [(subject, chapter, mock_mcq_count, sim_count), ...]
+
+
+def delete_chapter_mcqs(subject_name, chapter_name):
+    """Hard-deletes all MCQs, mock MCQs, and simulations (+ dependents) for one chapter."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT c.id FROM chapters c
+        JOIN subjects sub ON c.subject_id = sub.id
+        WHERE sub.name = %s AND c.name = %s
     ''', (subject_name, chapter_name))
+    row = cursor.fetchone()
+    if not row:
+        cursor.close()
+        return 0
+    chapter_id = row[0]
+
+    cursor.execute("DELETE FROM mcqs WHERE chapter_id = %s", (chapter_id,))
     deleted = cursor.rowcount
+    cursor.execute("DELETE FROM mock_mcqs WHERE chapter_id = %s", (chapter_id,))
+    cursor.execute("DELETE FROM simulations WHERE chapter_id = %s", (chapter_id,))
     conn.commit()
-    conn.close()
+    cursor.close()
     return deleted
 
 
 def delete_subject_mcqs(subject_name):
-    """Hard-deletes all MCQs (+ SRS states + practice log) for an entire subject."""
-    conn = sqlite3.connect(DB_NAME)
+    """Hard-deletes all MCQs, mock MCQs, and simulations (+ dependents) for an entire subject."""
+    conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute('''
-        DELETE FROM mcqs WHERE chapter_id IN (
-            SELECT c.id FROM chapters c
-            JOIN subjects sub ON c.subject_id = sub.id
-            WHERE sub.name = ?
-        )
+        SELECT c.id FROM chapters c
+        JOIN subjects sub ON c.subject_id = sub.id
+        WHERE sub.name = %s
     ''', (subject_name,))
+    chapter_ids = [r[0] for r in cursor.fetchall()]
+    if not chapter_ids:
+        cursor.close()
+        return 0
+
+    cursor.execute("DELETE FROM mcqs WHERE chapter_id = ANY(%s)", (chapter_ids,))
     deleted = cursor.rowcount
+    cursor.execute("DELETE FROM mock_mcqs WHERE chapter_id = ANY(%s)", (chapter_ids,))
+    cursor.execute("DELETE FROM simulations WHERE chapter_id = ANY(%s)", (chapter_ids,))
     conn.commit()
-    conn.close()
+    cursor.close()
     return deleted
 
 
@@ -556,7 +841,7 @@ def remove_duplicate_mcqs():
     Removes duplicate MCQs across the whole bank (keeps the oldest per chapter).
     Returns the number of duplicates removed.
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT id, chapter_id, question FROM mcqs WHERE is_retired = 0 ORDER BY id")
     rows = cursor.fetchall()
@@ -571,8 +856,35 @@ def remove_duplicate_mcqs():
             seen[key] = mcq_id
 
     if to_delete:
-        cursor.executemany("DELETE FROM mcqs WHERE id = ?", [(i,) for i in to_delete])
+        cursor.execute("DELETE FROM mcqs WHERE id = ANY(%s)", (to_delete,))
         conn.commit()
 
-    conn.close()
+    cursor.close()
+    return len(to_delete)
+
+
+def remove_duplicate_mock_mcqs():
+    """
+    Removes duplicate mock MCQs across the whole pool (keeps the oldest per chapter).
+    Returns the number of duplicates removed.
+    """
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, chapter_id, question FROM mock_mcqs WHERE is_retired = 0 ORDER BY id")
+    rows = cursor.fetchall()
+
+    seen = {}   # (chapter_id, norm_q) -> first_id
+    to_delete = []
+    for mcq_id, chapter_id, question in rows:
+        key = (chapter_id, _norm_q(question))
+        if key in seen:
+            to_delete.append(mcq_id)
+        else:
+            seen[key] = mcq_id
+
+    if to_delete:
+        cursor.execute("DELETE FROM mock_mcqs WHERE id = ANY(%s)", (to_delete,))
+        conn.commit()
+
+    cursor.close()
     return len(to_delete)
