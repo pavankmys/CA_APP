@@ -175,6 +175,9 @@ with tab1:
                     f"Correct answer: **{correct}**"
                 )
 
+            if explanation:
+                st.caption(f"**Explanation:** {explanation}")
+
             if st.button("Load Next →", use_container_width=True, type="primary"):
                 update_srs_item(mcq_id, rating,
                                 time_spent_seconds=int(elapsed),
