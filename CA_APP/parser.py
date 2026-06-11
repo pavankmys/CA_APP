@@ -41,18 +41,46 @@ class MCQBank(BaseModel):
     mcqs: List[MCQItem]
 
 
-class SimSubQuestion(BaseModel):
-    question: str = Field(description="Sub-question testing ONE specific aspect of the scenario above. Self-contained but may rely on scenario facts.")
-    option_A: str = Field(description="Option A — plausible to a student who made a specific common error")
-    option_B: str = Field(description="Option B — plausible to a student who made a specific common error")
-    option_C: str = Field(description="Option C — plausible to a student who made a specific common error")
-    option_D: str = Field(description="Option D — plausible to a student who made a specific common error")
-    correct_option: Literal['A', 'B', 'C', 'D'] = Field(description="Single uppercase letter: 'A', 'B', 'C', or 'D'")
+class JournalRow(BaseModel):
+    side: Literal['Dr', 'Cr'] = Field(description="Whether this leg of the journal entry is a debit or credit")
+    account_choices: List[str] = Field(description="4 to 6 plausible ledger account names for this row, including the correct one")
+    correct_account: str = Field(description="The correct account name for this row — must be one of account_choices")
+    correct_amount: float = Field(description="The correct Dr/Cr amount for this row, in rupees")
+
+
+class NumericItem(BaseModel):
+    question: str = Field(description="Self-contained instruction asking the student to compute and enter a single figure")
+    unit: str = Field(description="Unit of the expected answer, e.g. '₹', '%', 'days'")
+    correct_value: float = Field(description="The correct numeric answer")
     explanation: str = Field(
         description=(
             "Structured explanation: (1) governing provision — exact Section/AS/SA number; "
-            "(2) step-by-step working for numerical sub-questions; "
-            "(3) why each wrong option is incorrect."
+            "(2) step-by-step working showing how correct_value was computed."
+        )
+    )
+
+
+class DropdownItem(BaseModel):
+    question: str = Field(description="Self-contained instruction asking the student to pick the correct option from a dropdown")
+    choices: List[str] = Field(description="4 to 8 plausible choices, including the correct one")
+    correct_choice: str = Field(description="The correct choice — must be one of choices, exact text match")
+    explanation: str = Field(
+        description=(
+            "Structured explanation: (1) governing provision — exact Section/AS/SA number; "
+            "(2) why each other choice is incorrect, referring to choices ONLY by content, "
+            "never by position, since choices are reordered at random after generation."
+        )
+    )
+
+
+class JournalEntryItem(BaseModel):
+    question: str = Field(description="Instruction describing the transaction and asking the student to pass the journal entry")
+    narration: str = Field(description="The narration line for the journal entry, e.g. '(Being goods sold to XYZ on credit)'")
+    rows: List[JournalRow] = Field(description="2 to 6 rows representing each Dr/Cr leg of the journal entry, in order")
+    explanation: str = Field(
+        description=(
+            "Structured explanation: (1) governing provision — exact Section/AS/SA number; "
+            "(2) step-by-step working for how each row's account and amount were determined."
         )
     )
 
@@ -62,11 +90,21 @@ class SimulationItem(BaseModel):
     scenario: str = Field(
         description=(
             "Detailed multi-paragraph case-study scenario with all facts, figures, dates, and "
-            "named entities needed to answer every sub-question below."
+            "named entities needed to answer every item below."
         )
     )
-    sub_questions: List[SimSubQuestion] = Field(
-        description="4 to 6 independent MCQ sub-questions, each testing a different aspect of the scenario."
+    numeric_items: List[NumericItem] = Field(
+        description="1 to 2 numeric-entry items, each testing a different computation from the scenario."
+    )
+    dropdown_items: List[DropdownItem] = Field(
+        description="1 to 2 dropdown-selection items, each testing a different classification/treatment decision from the scenario."
+    )
+    journal_items: List[JournalEntryItem] = Field(
+        description=(
+            "0 to 1 journal-entry items. Include ONE only when the scenario involves a transaction "
+            "naturally recorded via a journal entry (Accounting / Advanced Accounting / Costing). "
+            "Leave empty for Tax / Law / Audit scenarios."
+        )
     )
 
 
@@ -222,6 +260,54 @@ _STRUCTURED_SCHEMA = {
 }
 
 # Flat JSON schema for simulations, used by Claude (tool calling) and Grok (json_schema format)
+_JOURNAL_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "side":             {"type": "string", "enum": ["Dr", "Cr"]},
+        "account_choices":  {"type": "array", "items": {"type": "string"}},
+        "correct_account":  {"type": "string"},
+        "correct_amount":   {"type": "number"}
+    },
+    "required": ["side", "account_choices", "correct_account", "correct_amount"],
+    "additionalProperties": False
+}
+
+_NUMERIC_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "question":      {"type": "string"},
+        "unit":          {"type": "string"},
+        "correct_value": {"type": "number"},
+        "explanation":   {"type": "string"}
+    },
+    "required": ["question", "unit", "correct_value", "explanation"],
+    "additionalProperties": False
+}
+
+_DROPDOWN_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "question":       {"type": "string"},
+        "choices":        {"type": "array", "items": {"type": "string"}},
+        "correct_choice": {"type": "string"},
+        "explanation":    {"type": "string"}
+    },
+    "required": ["question", "choices", "correct_choice", "explanation"],
+    "additionalProperties": False
+}
+
+_JOURNAL_ENTRY_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "question":    {"type": "string"},
+        "narration":   {"type": "string"},
+        "rows":        {"type": "array", "items": _JOURNAL_ROW_SCHEMA},
+        "explanation": {"type": "string"}
+    },
+    "required": ["question", "narration", "rows", "explanation"],
+    "additionalProperties": False
+}
+
 _SIM_STRUCTURED_SCHEMA = {
     "type": "object",
     "properties": {
@@ -230,49 +316,48 @@ _SIM_STRUCTURED_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "title":    {"type": "string"},
-                    "scenario": {"type": "string"},
-                    "sub_questions": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question":       {"type": "string"},
-                                "option_A":       {"type": "string"},
-                                "option_B":       {"type": "string"},
-                                "option_C":       {"type": "string"},
-                                "option_D":       {"type": "string"},
-                                "correct_option": {"type": "string", "enum": ["A", "B", "C", "D"]},
-                                "explanation":    {"type": "string"}
-                            },
-                            "required": ["question", "option_A", "option_B", "option_C", "option_D",
-                                         "correct_option", "explanation"]
-                        }
-                    }
+                    "title":          {"type": "string"},
+                    "scenario":       {"type": "string"},
+                    "numeric_items":  {"type": "array", "items": _NUMERIC_ITEM_SCHEMA},
+                    "dropdown_items": {"type": "array", "items": _DROPDOWN_ITEM_SCHEMA},
+                    "journal_items":  {"type": "array", "items": _JOURNAL_ENTRY_ITEM_SCHEMA}
                 },
-                "required": ["title", "scenario", "sub_questions"]
+                "required": ["title", "scenario", "numeric_items", "dropdown_items", "journal_items"],
+                "additionalProperties": False
             }
         }
     },
-    "required": ["simulations"]
+    "required": ["simulations"],
+    "additionalProperties": False
 }
 
 
 SIM_SYSTEM_INSTRUCTION = """You are a senior examiner at the Institute of Chartered Accountants of India (ICAI) \
-designing CASE-STUDY BASED MCQs for the CA Inter examination — the "Multiple Choice Questions based \
-on Case Scenario" format used in ICAI's RTPs and MTPs, similar in spirit to CPA Task-Based Simulations.
+designing TASK-BASED SIMULATIONS for the CA Inter examination, in the spirit of CPA Task-Based \
+Simulations (TBS) — case studies answered with varied response formats, NOT plain multiple-choice.
 
 === WHAT TO PRODUCE ===
 
 For each simulation, produce:
 1. A SCENARIO: a detailed, multi-paragraph case study describing one or more specific entities \
 (e.g. "M/s ABC & Co.", "XYZ Ltd.", "Mr. Suresh") with ALL facts, figures, dates, and conditions \
-needed to answer every sub-question below. The scenario should weave together MULTIPLE related \
+needed to answer every item below. The scenario should weave together MULTIPLE related \
 provisions/concepts from the source material — this is what makes it a "case", not a single fact pattern.
-2. Between 4 and 6 SUB-QUESTIONS, each in standard 4-option (A-D) MCQ format. Each sub-question must:
+2. NUMERIC ITEMS (1-2 per simulation): each asks the student to COMPUTE and TYPE IN a single figure \
+(e.g. "Compute the depreciation chargeable for the year ending 31 March 2024"). Provide the exact \
+correct_value and its unit (₹, %, days, etc.).
+3. DROPDOWN ITEMS (1-2 per simulation): each asks the student to SELECT the correct treatment, \
+classification, account head, AS/SA/Section number, or similar from a dropdown of 4-8 plausible choices.
+4. JOURNAL ENTRY ITEMS (0-1 per simulation, ONLY for Accounting/Advanced Accounting/Costing topics \
+where the scenario involves a transaction naturally recorded via a journal entry): describe the \
+transaction and provide 2-6 rows, each with a Dr or Cr side, 4-6 plausible account_choices, the \
+correct_account, and the correct_amount. Total Dr amounts MUST equal total Cr amounts. \
+For Tax/Law/Audit scenarios, leave journal_items empty.
+
+Every item must:
    - Test a DIFFERENT aspect, computation, or provision drawn from the scenario
    - Be answerable using ONLY the facts given in the scenario plus the source material
-   - Stand on its own with exactly one unambiguously correct option
+   - Stand on its own with exactly one unambiguously correct answer
 
 === DIFFICULTY ===
 
@@ -285,39 +370,56 @@ These simulations feed a separate HIGH-STAKES PROFICIENCY EXAM pool — explore 
 figures, and angles than standard practice questions on the same topic, while remaining grounded \
 in the source material.
 
-=== OPTION & EXPLANATION RULES (apply to every sub-question) ===
-- ALL 4 options must be plausible — a student who studied but made ONE common error picks each wrong option
-- Options must be PARALLEL in grammatical structure (all amounts, all dates, all actions — never mix)
-- Arrange numeric options in ascending order so position does not hint at the answer
-- NEVER use "All of the above" / "None of the above" / "Both (a) and (b)" style options
-- Explanation: (1) governing provision — exact Section/AS/SA number; (2) step-by-step working for \
-numerical sub-questions; (3) why each wrong option is incorrect — refer to each ONLY by its content, \
-NEVER by its letter (A/B/C/D) or position, since options are reordered at random after generation. \
-Maximum 150 words per sub-question.
+=== ITEM-SPECIFIC RULES ===
+
+NUMERIC ITEMS:
+- correct_value must be the exact computed figure — avoid figures that depend on a rounding \
+convention not stated in the scenario (state rounding instructions in the question if relevant, \
+e.g. "round to the nearest rupee")
+- Grading allows a small tolerance, but correct_value itself must be precise per the source material
+
+DROPDOWN ITEMS:
+- ALL choices must be plausible — a student who studied but made ONE common error picks each wrong choice
+- Choices must be PARALLEL in form (all account heads, all AS numbers, all treatments — never mix)
+- NEVER use "All of the above" / "None of the above" / "Both (a) and (b)" style choices
+- correct_choice text must match one of choices EXACTLY
+
+JOURNAL ENTRY ITEMS:
+- account_choices for each row must include the correct_account plus 3-5 plausible alternatives \
+(related but incorrect account heads)
+- Total of correct_amount across Dr rows MUST equal total across Cr rows
+- narration should be a concise standard accounting narration line
+
+EXPLANATION RULES (apply to every item):
+(1) governing provision — exact Section/AS/SA number; (2) step-by-step working showing how the \
+correct answer was derived; (3) for dropdown items, why each other choice is incorrect — refer to \
+choices ONLY by content, NEVER by position, since choices are reordered at random after generation. \
+Maximum 150 words per item.
 
 === SUBJECT-SPECIFIC GUIDANCE ===
 
-Financial Accounting / Advanced Accounting: ground every sub-question in a specific AS number, use \
+Financial Accounting / Advanced Accounting: ground every item in a specific AS number, use \
 realistic Indian Rupee figures (lakhs/crores). Favor multi-part scenarios: branch accounts, hire \
-purchase, partnership reconstitution, AS 21 consolidation.
+purchase, partnership reconstitution, AS 21 consolidation — good candidates for journal entry items.
 
 Taxation — Income Tax: state the Assessment Year explicitly. Build scenarios spanning multiple heads \
-of income, MAT computation, TDS implications, carry-forward of losses.
+of income, MAT computation, TDS implications, carry-forward of losses. No journal entry items.
 
 Taxation — GST: state intra-state / inter-state / exempt status. Build scenarios involving ITC \
-reversal on mixed supplies, valuation rules, reverse charge, e-way bill compliance.
+reversal on mixed supplies, valuation rules, reverse charge, e-way bill compliance. No journal entry items.
 
 Corporate & Other Laws: quote exact Section and sub-section numbers. Build scenarios around \
-non-compliance consequences, NCLT remedies, reduction of capital, related-party transactions.
+non-compliance consequences, NCLT remedies, reduction of capital, related-party transactions. \
+No journal entry items.
 
 Auditing & Assurance: reference exact SA numbers. Build scenarios around audit planning, sampling \
-decisions, evaluation of evidence, and forming/modifying the audit opinion.
+decisions, evaluation of evidence, and forming/modifying the audit opinion. No journal entry items.
 
 ABSOLUTE PROHIBITIONS:
-- DO NOT ask "what is the definition of X" in any sub-question
+- DO NOT ask "what is the definition of X" in any item
 - DO NOT generate a scenario answerable without reading the source material
 - DO NOT use figures like ₹100, ₹500, ₹1,000 — use realistic business figures (lakhs/crores)
-- DO NOT let the correct option be the longest option
+- DO NOT let the correct dropdown choice be the longest choice
 """
 
 
@@ -358,14 +460,18 @@ def _build_sim_user_prompt(subject: str, chapter: str, sim_count: int, text: str
 
     return (
         f"{context}"
-        f"Generate exactly {sim_count} CPA-style simulation(s) from the source material below, "
-        "strictly following the case-study format and difficulty instructions.\n\n"
+        f"Generate exactly {sim_count} CPA-style task-based simulation(s) from the source material "
+        "below, strictly following the case-study format and difficulty instructions.\n\n"
         "SELF-CHECK before finalising each simulation:\n"
-        "  ✓ Scenario contains every fact/figure/date needed by ALL of its sub-questions\n"
-        "  ✓ Each sub-question tests a DIFFERENT provision or computation\n"
-        "  ✓ Exactly ONE option is unambiguously correct per sub-question\n"
-        "  ✓ Arithmetic verified for numerical sub-questions\n"
-        "  ✓ Correct option is NOT the longest option\n"
+        "  ✓ Scenario contains every fact/figure/date needed by ALL items below\n"
+        "  ✓ 1-2 numeric_items, 1-2 dropdown_items, and 0-1 journal_items (only for Accounting/\n"
+        "    Advanced Accounting/Costing topics; empty list otherwise)\n"
+        "  ✓ Each item tests a DIFFERENT provision or computation\n"
+        "  ✓ Arithmetic verified for every numeric_item and journal_item amount\n"
+        "  ✓ Each dropdown_item's correct_choice text matches one of its choices EXACTLY\n"
+        "  ✓ Correct dropdown choice is NOT the longest choice\n"
+        "  ✓ For each journal_item, correct_account is one of its row's account_choices, and\n"
+        "    total Dr correct_amount == total Cr correct_amount\n"
         "  ✓ Statutory / AS / SA reference is cited in each explanation\n\n"
         f"Source Material:\n{text}"
     )
@@ -409,9 +515,121 @@ def _validate_mcqs(mcqs: list) -> list:
     return valid
 
 
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _validate_numeric_items(items: list) -> list:
+    valid = []
+    for item in items:
+        question = (item.get("question") or "").strip()
+        unit = (item.get("unit") or "").strip()
+        explanation = (item.get("explanation") or "").strip()
+
+        if len(question) < 15 or len(explanation) < 20:
+            continue
+        if not _is_number(item.get("correct_value")):
+            continue
+
+        valid.append({
+            "question": question,
+            "unit": unit,
+            "correct_value": float(item["correct_value"]),
+            "explanation": explanation,
+        })
+    return valid
+
+
+def _validate_dropdown_items(items: list) -> list:
+    valid = []
+    for item in items:
+        question = (item.get("question") or "").strip()
+        explanation = (item.get("explanation") or "").strip()
+        choices = [c.strip() for c in (item.get("choices") or []) if (c or "").strip()]
+        correct_choice = (item.get("correct_choice") or "").strip()
+
+        if len(question) < 15 or len(explanation) < 20:
+            continue
+        if not (4 <= len(choices) <= 8):
+            continue
+        if correct_choice not in choices:
+            continue
+
+        valid.append({
+            "question": question,
+            "choices": choices,
+            "correct_choice": correct_choice,
+            "explanation": explanation,
+        })
+    return valid
+
+
+def _validate_journal_items(items: list) -> list:
+    valid = []
+    for item in items:
+        question = (item.get("question") or "").strip()
+        narration = (item.get("narration") or "").strip()
+        explanation = (item.get("explanation") or "").strip()
+        raw_rows = item.get("rows") or []
+
+        if len(question) < 15 or len(explanation) < 20 or not narration:
+            continue
+        if not (2 <= len(raw_rows) <= 6):
+            continue
+
+        rows = []
+        dr_total = cr_total = 0.0
+        ok = True
+        for row in raw_rows:
+            side = row.get("side")
+            account_choices = [c.strip() for c in (row.get("account_choices") or []) if (c or "").strip()]
+            correct_account = (row.get("correct_account") or "").strip()
+            correct_amount = row.get("correct_amount")
+
+            if side not in ("Dr", "Cr"):
+                ok = False
+                break
+            if not (4 <= len(account_choices) <= 6):
+                ok = False
+                break
+            if correct_account not in account_choices:
+                ok = False
+                break
+            if not _is_number(correct_amount):
+                ok = False
+                break
+
+            correct_amount = float(correct_amount)
+            if side == "Dr":
+                dr_total += correct_amount
+            else:
+                cr_total += correct_amount
+
+            rows.append({
+                "side": side,
+                "account_choices": account_choices,
+                "correct_account": correct_account,
+                "correct_amount": correct_amount,
+            })
+
+        if not ok:
+            continue
+        # Journal entry must balance (allow tiny floating-point slack)
+        if abs(dr_total - cr_total) > 0.01:
+            continue
+
+        valid.append({
+            "question": question,
+            "narration": narration,
+            "rows": rows,
+            "explanation": explanation,
+        })
+    return valid
+
+
 def _validate_simulations(sims: list) -> list:
     """
-    Filters malformed simulations and their sub-questions.
+    Filters malformed simulations and their numeric/dropdown/journal items.
     Called after every API response before saving to DB.
     """
     valid = []
@@ -424,8 +642,11 @@ def _validate_simulations(sims: list) -> list:
         if len(title) < 5 or len(scenario) < 200:
             continue
 
-        sub_questions = _validate_mcqs(sim.get("sub_questions") or [])
-        if len(sub_questions) < 4:
+        numeric_items = _validate_numeric_items(sim.get("numeric_items") or [])
+        dropdown_items = _validate_dropdown_items(sim.get("dropdown_items") or [])
+        journal_items = _validate_journal_items(sim.get("journal_items") or [])
+
+        if not numeric_items or not dropdown_items:
             continue
 
         key = " ".join(title.lower().split())
@@ -433,7 +654,9 @@ def _validate_simulations(sims: list) -> list:
             continue
         seen.add(key)
 
-        sim["sub_questions"] = sub_questions
+        sim["numeric_items"] = numeric_items
+        sim["dropdown_items"] = dropdown_items
+        sim["journal_items"] = journal_items
         valid.append(sim)
 
     return valid
@@ -672,9 +895,17 @@ _KIMCHI_SIM_JSON_INSTRUCTION = (
     "\n\nYou MUST respond with a single JSON object and nothing else. "
     "No markdown fences, no explanatory text — only raw JSON.\n"
     'Required format: {"simulations": [{"title": "...", "scenario": "...", '
-    '"sub_questions": [{"question": "...", "option_A": "...", '
-    '"option_B": "...", "option_C": "...", "option_D": "...", '
-    '"correct_option": "A", "explanation": "..."}, ...]}, ...]}'
+    '"numeric_items": [{"question": "...", "unit": "...", "correct_value": 12345, '
+    '"explanation": "..."}, ...], '
+    '"dropdown_items": [{"question": "...", "choices": ["...", "...", "...", "..."], '
+    '"correct_choice": "...", "explanation": "..."}, ...], '
+    '"journal_items": [{"question": "...", "narration": "...", '
+    '"rows": [{"side": "Dr", "account_choices": ["...", "...", "...", "..."], '
+    '"correct_account": "...", "correct_amount": 12345}, ...], '
+    '"explanation": "..."}, ...]}, ...]}\n'
+    "numeric_items: 1-2 items. dropdown_items: 1-2 items. "
+    "journal_items: 0-1 items (only for Accounting/Advanced Accounting/Costing topics; "
+    "use an empty array [] for Tax/Law/Audit topics)."
 )
 
 

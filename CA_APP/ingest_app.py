@@ -151,9 +151,9 @@ st.divider()
 st.header("🧪 Generate Mock Exam Content (CPA-Style)")
 st.info(
     f"Provider: **{provider.upper()}** | "
-    "Generates a separate high-difficulty MCQ pool plus CPA-style simulations "
-    "(case-study scenario + 4-6 MCQ sub-questions) used by the CPA Simulation Exam. "
-    "Stored separately from the practice question bank."
+    "Generates a separate high-difficulty MCQ pool plus CPA-style task-based simulations "
+    "(case-study scenario + numeric entry, dropdown selection, and journal entry items) "
+    "used by the CPA Simulation Exam. Stored separately from the practice question bank."
 )
 
 mock_subject_input = st.text_input("Subject Name", key="mock_subject_input")

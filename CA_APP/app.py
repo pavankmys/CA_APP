@@ -503,13 +503,15 @@ with tab4:
                 ua = st.session_state.mock_answers.get(qs['mcq_id'])
                 mcq_per_question.append({**qs, 'user_answer': ua, 'is_correct': ua == qs['correct']})
 
+            sim_results = result['sim_results']
             sim_review = []
             for sim in sims_done:
-                sub_review = []
-                for sq in sim['sub_questions']:
-                    ua = st.session_state.mock_sim_answers.get(sq['id'])
-                    sub_review.append({**sq, 'user_answer': ua, 'is_correct': ua == sq['correct']})
-                sim_review.append({**sim, 'sub_questions': sub_review})
+                item_review = []
+                for item in sim['sub_items']:
+                    ua = st.session_state.mock_sim_answers.get(item['id'])
+                    is_correct = bool(sim_results.get(item['id'], 0))
+                    item_review.append({**item, 'user_answer': ua, 'is_correct': is_correct})
+                sim_review.append({**sim, 'sub_items': item_review})
 
             st.session_state.mock_result = {
                 **result,
@@ -580,15 +582,52 @@ with tab4:
 
             st.divider()
             sim_choices = {}
-            for i, sq in enumerate(sim['sub_questions'], 1):
-                st.markdown(f"**Sub-question {i}: {sq['question']}**")
-                opts = sq['options']
-                option_labels = [f"{k}) {v}" for k, v in sorted(opts.items())]
-                choice = st.radio(
-                    "Select your answer:", option_labels,
-                    key=f"sim_radio_{sim_idx}_{sq['id']}"
-                )
-                sim_choices[sq['id']] = choice[0]
+            for i, item in enumerate(sim['sub_items'], 1):
+                item_type = item['item_type']
+                payload = item['payload']
+
+                if item_type == 'numeric':
+                    st.markdown(f"**Item {i}: {item['question']}**")
+                    label = f"Your answer ({payload['unit']})" if payload['unit'] else "Your answer"
+                    val = st.number_input(
+                        label, key=f"sim_num_{sim_idx}_{item['id']}",
+                        value=0.0, step=1.0, format="%.2f"
+                    )
+                    sim_choices[item['id']] = {'value': val}
+
+                elif item_type == 'dropdown':
+                    st.markdown(f"**Item {i}: {item['question']}**")
+                    selected = st.selectbox(
+                        "Select your answer:", payload['choices'],
+                        key=f"sim_dd_{sim_idx}_{item['id']}",
+                        index=None, placeholder="Select an option..."
+                    )
+                    sim_choices[item['id']] = {'choice': selected}
+
+                elif item_type == 'journal_entry':
+                    st.markdown(f"**Item {i}: {item['question']}**")
+                    h1, h2, h3 = st.columns([1, 3, 2])
+                    h2.markdown("**Account**")
+                    h3.markdown("**Amount (₹)**")
+                    rows_answers = []
+                    for r_i, row in enumerate(payload['rows']):
+                        c1, c2, c3 = st.columns([1, 3, 2])
+                        c1.markdown(f"**{row['side']}**")
+                        acct = c2.selectbox(
+                            "Account", row['account_choices'],
+                            key=f"sim_je_acct_{sim_idx}_{item['id']}_{r_i}",
+                            index=None, placeholder="Select account...",
+                            label_visibility="collapsed"
+                        )
+                        amt = c3.number_input(
+                            "Amount", key=f"sim_je_amt_{sim_idx}_{item['id']}_{r_i}",
+                            value=0.0, step=1.0, format="%.2f",
+                            label_visibility="collapsed"
+                        )
+                        rows_answers.append({'account': acct, 'amount': amt})
+                    st.caption(f"Narration: {payload['narration']}")
+                    sim_choices[item['id']] = {'rows': rows_answers}
+
                 st.markdown("")
 
             st.divider()
@@ -689,13 +728,13 @@ with tab4:
             st.subheader("Simulation Section — Breakdown by Case")
             sim_table_rows = []
             for sim in sim_review:
-                subqs = sim['sub_questions']
-                correct_n = sum(1 for sq in subqs if sq['is_correct'])
-                acc = round(correct_n / len(subqs) * 100) if subqs else 0
+                items = sim['sub_items']
+                correct_n = sum(1 for it in items if it['is_correct'])
+                acc = round(correct_n / len(items) * 100) if items else 0
                 sim_table_rows.append({
                     "Simulation": sim['title'],
                     "Chapter":    f"{sim['subject']} › {sim['chapter']}",
-                    "Sub-Qs":     len(subqs),
+                    "Items":      len(items),
                     "Correct":    correct_n,
                     "Accuracy":   f"{acc}%",
                 })
@@ -730,22 +769,50 @@ with tab4:
                 for s_i, sim in enumerate(sim_review, 1):
                     st.markdown(f"#### {s_i}. {sim['title']} ({sim['subject']} › {sim['chapter']})")
                     st.markdown(sim['scenario'])
-                    for sq_i, sq in enumerate(sim['sub_questions'], 1):
-                        ua = sq['user_answer'] or "—"
-                        correct_ans = sq['correct']
-                        st.markdown(f"**{s_i}.{sq_i}. {sq['question']}**")
-                        opts = sq['options']
-                        for letter in ['A', 'B', 'C', 'D']:
-                            val = opts.get(letter, '')
-                            if letter == correct_ans and letter == ua:
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;**✅ {letter}) {val}** ← your answer (correct)")
-                            elif letter == correct_ans:
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;**✅ {letter}) {val}** ← correct answer")
-                            elif letter == ua:
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;**❌ {letter}) {val}** ← your answer")
-                            else:
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;{letter}) {val}")
-                        st.caption(f"**Explanation:** {sq['explanation']}")
+                    for sq_i, item in enumerate(sim['sub_items'], 1):
+                        result_icon = "✅" if item['is_correct'] else "❌"
+                        st.markdown(f"**{s_i}.{sq_i}. {result_icon} {item['question']}**")
+                        ua = item['user_answer'] or {}
+                        payload = item['payload']
+
+                        if item['item_type'] == 'numeric':
+                            user_val = ua.get('value')
+                            unit = payload['unit']
+                            user_display = f"{user_val} {unit}".strip() if user_val is not None else "—"
+                            correct_display = f"{payload['correct_value']} {unit}".strip()
+                            st.markdown(f"&nbsp;&nbsp;&nbsp;Your answer: **{user_display}**")
+                            if not item['is_correct']:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;✅ Correct answer: **{correct_display}**")
+
+                        elif item['item_type'] == 'dropdown':
+                            user_choice = ua.get('choice')
+                            correct_choice = payload['correct_choice']
+                            for choice in payload['choices']:
+                                if choice == correct_choice and choice == user_choice:
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;**✅ {choice}** ← your answer (correct)")
+                                elif choice == correct_choice:
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;**✅ {choice}** ← correct answer")
+                                elif choice == user_choice:
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;**❌ {choice}** ← your answer")
+                                else:
+                                    st.markdown(f"&nbsp;&nbsp;&nbsp;{choice}")
+
+                        elif item['item_type'] == 'journal_entry':
+                            st.caption(f"Narration: {payload['narration']}")
+                            user_rows = ua.get('rows') or []
+                            je_table = []
+                            for r_i, row in enumerate(payload['rows']):
+                                user_row = user_rows[r_i] if r_i < len(user_rows) else {}
+                                je_table.append({
+                                    "Side":              row['side'],
+                                    "Your Account":      user_row.get('account') or "—",
+                                    "Correct Account":   row['correct_account'],
+                                    "Your Amount":       user_row.get('amount', "—"),
+                                    "Correct Amount (₹)": row['correct_amount'],
+                                })
+                            st.table(je_table)
+
+                        st.caption(f"**Explanation:** {item['explanation']}")
                     st.divider()
 
         if st.button("🔁 Start New Test", type="primary"):

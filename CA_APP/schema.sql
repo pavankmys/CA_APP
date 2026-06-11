@@ -57,9 +57,9 @@ CREATE TABLE IF NOT EXISTS simulation_questions (
     id              SERIAL PRIMARY KEY,
     simulation_id   INTEGER REFERENCES simulations(id) ON DELETE CASCADE,
     seq_no          INTEGER NOT NULL,
-    question        TEXT NOT NULL,
-    options         TEXT NOT NULL,
-    correct_option  TEXT NOT NULL,
+    item_type       TEXT NOT NULL,      -- 'numeric' | 'dropdown' | 'journal_entry'
+    question        TEXT NOT NULL,      -- prompt/instructions for this item
+    payload         TEXT NOT NULL,      -- JSON: type-specific data (choices, correct values, etc.)
     explanation     TEXT
 );
 

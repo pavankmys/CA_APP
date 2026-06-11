@@ -161,7 +161,7 @@ def save_generated_mock_mcqs(subject_name, chapter_name, mcq_list):
 
 
 def save_generated_simulations(subject_name, chapter_name, sim_list):
-    """Inserts simulations and their MCQ sub-questions into simulations / simulation_questions."""
+    """Inserts simulations and their numeric/dropdown/journal-entry items into simulations / simulation_questions."""
     conn = _get_conn()
     cursor = conn.cursor()
 
@@ -193,20 +193,46 @@ def save_generated_simulations(subject_name, chapter_name, sim_list):
         ''', (chapter_id, sim['title'], sim['scenario'], 'hard'))
         sim_id = cursor.fetchone()[0]
 
-        for seq_no, sub in enumerate(sim['sub_questions'], start=1):
-            letters = ['A', 'B', 'C', 'D']
-            texts = [sub['option_A'], sub['option_B'], sub['option_C'], sub['option_D']]
-            original_correct_text = sub[f"option_{sub['correct_option']}"]
-            random.shuffle(texts)
-            options_dict = dict(zip(letters, texts))
-            correct_option = next(k for k, v in options_dict.items() if v == original_correct_text)
+        seq_no = 1
 
+        for item in sim['numeric_items']:
+            payload = {'unit': item['unit'], 'correct_value': item['correct_value']}
             cursor.execute('''
                 INSERT INTO simulation_questions
-                    (simulation_id, seq_no, question, options, correct_option, explanation)
+                    (simulation_id, seq_no, item_type, question, payload, explanation)
                 VALUES (%s, %s, %s, %s, %s, %s)
-            ''', (sim_id, seq_no, sub['question'], json.dumps(options_dict),
-                  correct_option, sub['explanation']))
+            ''', (sim_id, seq_no, 'numeric', item['question'], json.dumps(payload), item['explanation']))
+            seq_no += 1
+
+        for item in sim['dropdown_items']:
+            choices = item['choices'][:]
+            random.shuffle(choices)
+            payload = {'choices': choices, 'correct_choice': item['correct_choice']}
+            cursor.execute('''
+                INSERT INTO simulation_questions
+                    (simulation_id, seq_no, item_type, question, payload, explanation)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            ''', (sim_id, seq_no, 'dropdown', item['question'], json.dumps(payload), item['explanation']))
+            seq_no += 1
+
+        for item in sim['journal_items']:
+            rows = []
+            for row in item['rows']:
+                account_choices = row['account_choices'][:]
+                random.shuffle(account_choices)
+                rows.append({
+                    'side': row['side'],
+                    'account_choices': account_choices,
+                    'correct_account': row['correct_account'],
+                    'correct_amount': row['correct_amount'],
+                })
+            payload = {'narration': item['narration'], 'rows': rows}
+            cursor.execute('''
+                INSERT INTO simulation_questions
+                    (simulation_id, seq_no, item_type, question, payload, explanation)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            ''', (sim_id, seq_no, 'journal_entry', item['question'], json.dumps(payload), item['explanation']))
+            seq_no += 1
 
         added += 1
 
@@ -395,7 +421,7 @@ def get_cpa_exam_simulations(subject_name):
     """
     Selects target_n = min(7, max(5, n_available_chapters)) chapters with
     simulations (random, capped by availability), one random non-retired
-    simulation per chosen chapter, each with its ordered sub_questions.
+    simulation per chosen chapter, each with its ordered sub_items.
     """
     conn = _get_conn()
     cursor = conn.cursor()
@@ -437,18 +463,18 @@ def get_cpa_exam_simulations(subject_name):
         sim_id, title, scenario, chapter_name, subject_name_row = random.choice(candidates)
 
         cursor.execute('''
-            SELECT id, question, options, correct_option, explanation
+            SELECT id, item_type, question, payload, explanation
             FROM simulation_questions
             WHERE simulation_id = %s
             ORDER BY seq_no
         ''', (sim_id,))
-        sub_questions = []
-        for sq_id, question, options_json, correct, explanation in cursor.fetchall():
-            sub_questions.append({
+        sub_items = []
+        for sq_id, item_type, question, payload_json, explanation in cursor.fetchall():
+            sub_items.append({
                 'id':          sq_id,
+                'item_type':   item_type,
                 'question':    question,
-                'options':     json.loads(options_json),
-                'correct':     correct,
+                'payload':     json.loads(payload_json),
                 'explanation': explanation,
             })
 
@@ -458,11 +484,55 @@ def get_cpa_exam_simulations(subject_name):
             'scenario':      scenario,
             'chapter':       chapter_name,
             'subject':       subject_name_row,
-            'sub_questions': sub_questions,
+            'sub_items':     sub_items,
         })
 
     cursor.close()
     return simulations
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _grade_sim_item(item_type, payload, user_answer):
+    """
+    Grades one simulation_questions item. Returns 1 if correct, 0 otherwise.
+
+    user_answer shapes: numeric -> {'value': ...}, dropdown -> {'choice': ...},
+    journal_entry -> {'rows': [{'account':, 'amount':}, ...]}
+    """
+    if not user_answer:
+        return 0
+
+    if item_type == 'numeric':
+        value = user_answer.get('value')
+        if not _is_number(value):
+            return 0
+        correct = payload['correct_value']
+        tolerance = max(abs(correct) * 0.01, 1)
+        return 1 if abs(value - correct) <= tolerance else 0
+
+    if item_type == 'dropdown':
+        return 1 if user_answer.get('choice') == payload['correct_choice'] else 0
+
+    if item_type == 'journal_entry':
+        user_rows = user_answer.get('rows') or []
+        correct_rows = payload['rows']
+        if len(user_rows) != len(correct_rows):
+            return 0
+        for ur, cr in zip(user_rows, correct_rows):
+            if ur.get('account') != cr['correct_account']:
+                return 0
+            amount = ur.get('amount')
+            if not _is_number(amount):
+                return 0
+            tolerance = max(abs(cr['correct_amount']) * 0.01, 1)
+            if abs(amount - cr['correct_amount']) > tolerance:
+                return 0
+        return 1
+
+    return 0
 
 
 def save_cpa_exam(subject_name, mcq_questions, mcq_answers, simulations, sim_answers, time_taken_seconds):
@@ -473,10 +543,12 @@ def save_cpa_exam(subject_name, mcq_questions, mcq_answers, simulations, sim_ans
     mcq_questions : list from get_cpa_exam_mcqs
     mcq_answers   : dict {mcq_id: selected_option}
     simulations   : list from get_cpa_exam_simulations
-    sim_answers   : dict {simulation_question_id: selected_option}
+    sim_answers   : dict {simulation_question_id: user_answer} where user_answer is
+                    {'value': ...} / {'choice': ...} / {'rows': [{'account':, 'amount':}, ...]}
 
     MCQ scoring is difficulty-weighted (easy=1pt, medium=2pts, hard=3pts);
-    simulation scoring is a simple correct/total ratio across all sub-questions.
+    simulation scoring is a simple correct/total ratio across all sub_items, graded by
+    _grade_sim_item (numeric: ±1% tolerance; dropdown: exact choice; journal_entry: every row correct).
     overall_pct = (mcq_pct + sim_pct) / 2. Proficient if overall_pct >= 75 AND
     minimum item-count gates (CPA_EXAM_MIN_MCQS, CPA_EXAM_MIN_SIMS) are met.
     """
@@ -509,15 +581,18 @@ def save_cpa_exam(subject_name, mcq_questions, mcq_answers, simulations, sim_ans
 
     sim_total = 0
     sim_correct = 0
+    sim_results = {}
 
     for sim in simulations:
-        for sq in sim['sub_questions']:
+        for item in sim['sub_items']:
             sim_total += 1
-            user_ans = sim_answers.get(sq['id'])
-            is_correct = 1 if user_ans == sq['correct'] else 0
+            user_ans = sim_answers.get(item['id'])
+            is_correct = _grade_sim_item(item['item_type'], item['payload'], user_ans)
+            sim_results[item['id']] = is_correct
             if is_correct:
                 sim_correct += 1
-            answer_rows.append(('sim', sq['id'], user_ans, is_correct, 'hard'))
+            selected_json = json.dumps(user_ans) if user_ans else None
+            answer_rows.append(('sim', item['id'], selected_json, is_correct, 'hard'))
 
     sim_pct = round((sim_correct / sim_total * 100), 1) if sim_total > 0 else 0.0
 
@@ -556,6 +631,7 @@ def save_cpa_exam(subject_name, mcq_questions, mcq_answers, simulations, sim_ans
         'sim_pct':       sim_pct,
         'overall_pct':   overall_pct,
         'is_proficient': bool(is_proficient),
+        'sim_results':   sim_results,
     }
 
 
