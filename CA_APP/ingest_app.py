@@ -435,12 +435,17 @@ if st.button("Generate Audio Notes", type="primary"):
         skipped = []   # [(chunk_index, title, report)]
 
         for i, chunk in enumerate(chunks):
-            status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — generating script...")
-            title, script = audio_notes.generate_episode_script(chunk, gemini_api_key, provider="gemini")
-            title = title or f"{chap} — Part {i + 1}"
+            try:
+                status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — generating script...")
+                title, script = audio_notes.generate_episode_script(chunk, gemini_api_key, provider="gemini")
+                title = title or f"{chap} — Part {i + 1}"
 
-            status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — verifying against source...")
-            is_clean, report = audio_notes.verify_script(chunk, script, gemini_api_key, provider="gemini")
+                status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — verifying against source...")
+                is_clean, report = audio_notes.verify_script(chunk, script, gemini_api_key, provider="gemini")
+            except Exception as e:
+                skipped.append((i + 1, f"{chap} — Part {i + 1}", f"Generation failed: {e}"))
+                progress_bar.progress((i + 1) / len(chunks))
+                continue
 
             if not is_clean:
                 skipped.append((i + 1, title, report))

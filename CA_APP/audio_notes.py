@@ -105,6 +105,22 @@ def chunk_chapter_text(file_bytes, chunk_size=AUDIO_CHUNK_SIZE):
     return chunks
 
 
+def _extract_gemini_text(response):
+    """Returns response.text, or raises a RuntimeError with diagnostic info if Gemini
+    returned no usable content (e.g. content filtering, or an empty STOP response)."""
+    try:
+        return response.text
+    except ValueError as e:
+        candidate = response.candidates[0] if response.candidates else None
+        finish_reason = candidate.finish_reason.name if candidate else "UNKNOWN"
+        feedback = getattr(response, "prompt_feedback", None)
+        raise RuntimeError(
+            f"Gemini returned no content (finish_reason={finish_reason}, "
+            f"prompt_feedback={feedback}). This is usually a transient issue or content "
+            f"filtering on this chunk — try regenerating."
+        ) from e
+
+
 def _parse_title(text):
     title = None
     if text.upper().startswith("TITLE:"):
@@ -124,8 +140,9 @@ def _generate_episode_script_gemini(source_text, api_key):
     response = model.generate_content(
         prompt,
         generation_config=genai.types.GenerationConfig(temperature=0.1),
+        safety_settings="BLOCK_NONE",
     )
-    return _parse_title(response.text.strip())
+    return _parse_title(_extract_gemini_text(response).strip())
 
 
 def _generate_episode_script_kimchi(source_text, api_key):
@@ -207,8 +224,9 @@ def _verify_script_gemini(source_text, script_text, api_key):
     response = model.generate_content(
         prompt,
         generation_config=genai.types.GenerationConfig(temperature=0.0),
+        safety_settings="BLOCK_NONE",
     )
-    report = response.text.strip()
+    report = _extract_gemini_text(response).strip()
     return report == "NO CRITICAL ISSUES", report
 
 
