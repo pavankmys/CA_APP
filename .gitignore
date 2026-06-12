@@ -19,3 +19,6 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Audio notes POC output (generated scripts/audio, not source)
+CA_APP/audio_poc_output/

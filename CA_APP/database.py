@@ -951,6 +951,116 @@ def remove_duplicate_mcqs():
     return len(to_delete)
 
 
+# ── Audio Notes ──────────────────────────────────────────────────────────────
+
+def get_chapters_for_subject(subject_name):
+    """Returns [(chapter_id, chapter_name), ...] for a subject, ordered by name."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT c.id, c.name FROM chapters c
+        JOIN subjects sub ON c.subject_id = sub.id
+        WHERE sub.name = %s
+        ORDER BY c.name
+    ''', (subject_name,))
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+def get_or_create_chapter(subject_name, chapter_name):
+    """Returns the chapter_id for (subject_name, chapter_name), creating both if needed."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO subjects (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (subject_name,))
+    cursor.execute("SELECT id FROM subjects WHERE name = %s", (subject_name,))
+    subject_id = cursor.fetchone()[0]
+
+    cursor.execute(
+        "INSERT INTO chapters (subject_id, name) VALUES (%s, %s) ON CONFLICT (subject_id, name) DO NOTHING",
+        (subject_id, chapter_name)
+    )
+    cursor.execute("SELECT id FROM chapters WHERE subject_id = %s AND name = %s", (subject_id, chapter_name))
+    chapter_id = cursor.fetchone()[0]
+    conn.commit()
+    cursor.close()
+    return chapter_id
+
+
+def save_audio_episode(chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes):
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO audio_episodes
+            (chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    ''', (chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes))
+    episode_id = cursor.fetchone()[0]
+    conn.commit()
+    cursor.close()
+    return episode_id
+
+
+def get_episodes_for_chapter(chapter_id):
+    """Returns [(id, episode_num, title, audio_url, duration_seconds, word_count, created_at), ...]."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, episode_num, title, audio_url, duration_seconds, word_count, created_at
+        FROM audio_episodes WHERE chapter_id = %s ORDER BY episode_num
+    ''', (chapter_id,))
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+def get_all_episodes_for_feed():
+    """Returns all episodes for the podcast feed, in intended listening order:
+    [(id, title, audio_url, duration_seconds, file_size_bytes, episode_num, subject_name, chapter_name), ...]
+    """
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT ae.id, ae.title, ae.audio_url, ae.duration_seconds, ae.file_size_bytes,
+               ae.episode_num, sub.name, c.name
+        FROM audio_episodes ae
+        JOIN chapters c ON ae.chapter_id = c.id
+        JOIN subjects sub ON c.subject_id = sub.id
+        ORDER BY sub.name, c.name, ae.episode_num
+    ''')
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+def get_audio_episode_summary():
+    """Returns [(subject, chapter, episode_count, total_duration_seconds), ...]."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT sub.name, c.name, COUNT(ae.id), COALESCE(SUM(ae.duration_seconds), 0)
+        FROM audio_episodes ae
+        JOIN chapters c ON ae.chapter_id = c.id
+        JOIN subjects sub ON c.subject_id = sub.id
+        GROUP BY sub.name, c.name
+        ORDER BY sub.name, c.name
+    ''')
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+def delete_audio_episode(episode_id):
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM audio_episodes WHERE id = %s", (episode_id,))
+    deleted = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    return deleted
+
+
 def remove_duplicate_mock_mcqs():
     """
     Removes duplicate mock MCQs across the whole pool (keeps the oldest per chapter).

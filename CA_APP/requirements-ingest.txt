@@ -6,3 +6,7 @@ pydantic
 google-generativeai
 anthropic
 openai
+edge-tts
+mutagen
+feedgen
+boto3

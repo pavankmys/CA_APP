@@ -1,14 +1,21 @@
 import streamlit as st
 import os
+import re
 import time
+import asyncio
+import tempfile
 from dotenv import load_dotenv
 from database import (
     save_generated_mcqs, get_question_bank_summary,
     delete_chapter_mcqs, delete_subject_mcqs, remove_duplicate_mcqs,
     save_generated_mock_mcqs, save_generated_simulations,
     get_mock_bank_summary, remove_duplicate_mock_mcqs,
+    get_or_create_chapter, save_audio_episode, get_episodes_for_chapter,
+    get_all_episodes_for_feed, get_audio_episode_summary, delete_audio_episode,
 )
 from parser import extract_text_chunks, generate_from_chunk, generate_mock_mcqs_from_chunk, generate_simulations_from_chunk
+import audio_notes
+import audio_publish
 
 load_dotenv()
 
@@ -363,3 +370,165 @@ with st.expander("Manage Question Bank", expanded=False):
                 if st.button("Cancel", use_container_width=True):
                     st.session_state.delete_confirm = None
                     st.rerun()
+
+# ── Audio Notes ─────────────────────────────────────────────────────────────
+def _slugify(text):
+    return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-') or "x"
+
+
+st.divider()
+st.header("🎧 Generate Audio Notes")
+
+gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+r2_account_id = os.getenv("R2_ACCOUNT_ID", "")
+r2_access_key_id = os.getenv("R2_ACCESS_KEY_ID", "")
+r2_secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY", "")
+r2_bucket = os.getenv("R2_BUCKET", "")
+r2_public_url = os.getenv("R2_PUBLIC_URL", "")
+r2_configured = all([r2_account_id, r2_access_key_id, r2_secret_access_key, r2_bucket, r2_public_url])
+
+st.info(
+    "Converts a chapter PDF into ~20-30 min spoken-explainer audio episodes. Each script is "
+    "verified against the source for hallucinated numbers/references before being synthesized "
+    "and uploaded. Always uses **Gemini** (long-form generation isn't reliable on other "
+    "providers), regardless of the `AI_PROVIDER` setting above."
+)
+
+if not gemini_api_key:
+    st.warning("`GEMINI_API_KEY` is not set in `.env` — required for script generation.")
+if not r2_configured:
+    st.warning("`R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` / `R2_PUBLIC_URL` "
+               "are not all set in `.env` — required to upload audio and publish the feed.")
+
+audio_subject_input = st.text_input("Subject Name", key="audio_subject_input")
+audio_chapter_input = st.text_input("Chapter / Ref Name", key="audio_chapter_input")
+audio_uploaded_file = st.file_uploader("Choose a source PDF file", type=["pdf"], key="audio_uploaded_file")
+audio_voice = st.text_input("edge-tts voice", value=audio_notes.DEFAULT_VOICE, key="audio_voice")
+
+if audio_uploaded_file:
+    size_kb = audio_uploaded_file.size / 1024
+    st.caption(f"📄 **{audio_uploaded_file.name}** — {size_kb:.0f} KB")
+
+if st.button("Generate Audio Notes", type="primary"):
+    if not gemini_api_key or not r2_configured:
+        st.error("Missing required configuration — see warnings above.")
+    elif not audio_subject_input or not audio_chapter_input or not audio_uploaded_file:
+        st.warning("Please complete all input fields.")
+    else:
+        subj = audio_subject_input.strip()
+        chap = audio_chapter_input.strip()
+        file_bytes = audio_uploaded_file.read()
+        r2_client = audio_publish.make_client(r2_account_id, r2_access_key_id, r2_secret_access_key)
+
+        with st.spinner("Extracting and chunking PDF..."):
+            chunks = audio_notes.chunk_chapter_text(file_bytes)
+
+        st.info(f"📊 {len(chunks)} source chunk(s) — each may produce one or more episodes")
+
+        chapter_id = get_or_create_chapter(subj, chap)
+        existing = get_episodes_for_chapter(chapter_id)
+        next_episode_num = (max(ep[1] for ep in existing) + 1) if existing else 1
+
+        progress_bar = st.progress(0)
+        status = st.empty()
+        saved = []     # [(episode_num, title, duration_seconds)]
+        skipped = []   # [(chunk_index, title, report)]
+
+        for i, chunk in enumerate(chunks):
+            status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — generating script...")
+            title, script = audio_notes.generate_episode_script(chunk, gemini_api_key, provider="gemini")
+            title = title or f"{chap} — Part {i + 1}"
+
+            status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — verifying against source...")
+            is_clean, report = audio_notes.verify_script(chunk, script, gemini_api_key, provider="gemini")
+
+            if not is_clean:
+                skipped.append((i + 1, title, report))
+                progress_bar.progress((i + 1) / len(chunks))
+                continue
+
+            for ep_title, ep_script in audio_notes.split_script_into_episodes(title, script):
+                status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — synthesizing audio for '{ep_title}'...")
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    mp3_path = os.path.join(tmpdir, "episode.mp3")
+                    asyncio.run(audio_notes.synthesize(ep_script, audio_voice, mp3_path))
+                    duration = audio_notes.get_audio_duration_seconds(mp3_path)
+                    file_size = os.path.getsize(mp3_path)
+
+                    storage_path = f"{_slugify(subj)}/{_slugify(chap)}/episode_{next_episode_num:03d}.mp3"
+                    status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — uploading '{ep_title}'...")
+                    audio_url = audio_publish.upload_audio_file(
+                        r2_client, r2_bucket, r2_public_url, mp3_path, storage_path
+                    )
+
+                save_audio_episode(
+                    chapter_id, next_episode_num, ep_title, audio_url,
+                    duration, len(ep_script.split()), file_size
+                )
+                saved.append((next_episode_num, ep_title, duration))
+                next_episode_num += 1
+
+            progress_bar.progress((i + 1) / len(chunks))
+
+        status.empty()
+        progress_bar.empty()
+
+        if saved:
+            st.success(f"✅ Saved and uploaded {len(saved)} episode(s) for *{subj} › {chap}*:")
+            for ep_num, ep_title, duration in saved:
+                st.write(f"- Episode {ep_num}: **{ep_title}** (~{duration // 60}m {duration % 60}s)")
+            st.info("Go to **Manage Audio Notes** below and click **Publish Feed** to update the podcast feed.")
+
+        if skipped:
+            st.warning(f"⚠️ {len(skipped)} chunk(s) failed verification and were skipped (no audio generated):")
+            for chunk_num, title, report in skipped:
+                with st.expander(f"Chunk {chunk_num}: {title} — verification issues"):
+                    st.text(report)
+
+# ── Manage Audio Notes ──────────────────────────────────────────────────────
+with st.expander("Manage Audio Notes", expanded=False):
+    audio_summary = get_audio_episode_summary()
+
+    if not audio_summary:
+        st.info("No audio episodes yet. Generate some above.")
+    else:
+        for subj, chap, count, total_seconds in audio_summary:
+            total_minutes = total_seconds // 60
+            st.write(f"**{subj} › {chap}** — {count} episode(s), ~{total_minutes} min total")
+
+        st.divider()
+
+        if st.button("Publish Feed", type="primary"):
+            if not r2_configured:
+                st.error("R2 configuration is missing in `.env` — see warning above.")
+            else:
+                rows = get_all_episodes_for_feed()
+                episodes = [
+                    {
+                        "title": title, "audio_url": audio_url, "duration_seconds": duration,
+                        "file_size_bytes": file_size, "episode_num": episode_num,
+                        "subject": subj, "chapter": chap,
+                    }
+                    for (_id, title, audio_url, duration, file_size, episode_num, subj, chap) in rows
+                ]
+                with st.spinner("Building and uploading feed.xml..."):
+                    r2_client = audio_publish.make_client(r2_account_id, r2_access_key_id, r2_secret_access_key)
+                    feed_url = audio_publish.publish_feed(r2_client, r2_bucket, r2_public_url, episodes)
+                st.success("Feed published! Add this URL in your podcast app (e.g. Pocket Casts → Discover → search icon → paste URL):")
+                st.code(feed_url)
+
+        st.divider()
+        st.subheader("Delete an Episode")
+        all_rows = get_all_episodes_for_feed()
+        if all_rows:
+            options = {
+                f"{subj} › {chap} — Episode {episode_num}: {title}": ep_id
+                for (ep_id, title, _url, _dur, _size, episode_num, subj, chap) in all_rows
+            }
+            choice = st.selectbox("Select episode", list(options.keys()), key="audio_delete_choice")
+            if st.button("Delete Episode", type="secondary"):
+                delete_audio_episode(options[choice])
+                st.success("Deleted. Click **Publish Feed** above to update the podcast feed.")
+                st.rerun()
+        else:
+            st.caption("No episodes to delete.")
