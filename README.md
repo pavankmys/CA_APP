@@ -50,7 +50,7 @@ uses Gemini (long-form generation isn't reliable on the other providers).
 
 ## Setup
 
-### 1. Database (Supabase)
+### Database (Supabase)
 
 1. Create a free [Supabase](https://supabase.com) project.
 2. In the SQL editor, run `CA_APP/schema.sql` to create the base tables.
@@ -61,28 +61,49 @@ uses Gemini (long-form generation isn't reliable on the other providers).
 5. Get your connection string (Project Settings → Database → Connection
    string → use the **pooler** connection for IPv4 compatibility).
 
-### 2. Local environment
+---
+
+## How to Run
+
+### Windows (PowerShell)
 
 ```powershell
 python -m venv venv
 venv\Scripts\pip install -r CA_APP/requirements.txt          # hosted app only
 venv\Scripts\pip install -r CA_APP/requirements-ingest.txt    # ingest app (adds AI SDKs)
-```
 
-Copy the example config files and fill in your real values (both are
-gitignored):
-
-```powershell
 copy CA_APP\.env.example CA_APP\.env
 copy CA_APP\.streamlit\secrets.toml.example CA_APP\.streamlit\secrets.toml
 ```
 
-### 3. Run locally
+Fill in your real values in `CA_APP\.env` (both files are gitignored), then run:
 
 ```powershell
 venv\Scripts\streamlit run CA_APP/app.py          # practice app
 venv\Scripts\streamlit run CA_APP/ingest_app.py   # ingest app (desktop)
 ```
+
+### Linux / Fedora (bash)
+
+```bash
+python3 -m venv venv
+venv/bin/pip install -r CA_APP/requirements.txt          # hosted app only
+venv/bin/pip install -r CA_APP/requirements-ingest.txt    # ingest app (adds AI SDKs)
+
+cp CA_APP/.env.example CA_APP/.env
+cp CA_APP/.streamlit/secrets.toml.example CA_APP/.streamlit/secrets.toml
+```
+
+Fill in your real values in `CA_APP/.env` (both files are gitignored), then run:
+
+```bash
+venv/bin/streamlit run CA_APP/app.py          # practice app
+venv/bin/streamlit run CA_APP/ingest_app.py   # ingest app (desktop)
+```
+
+> On Fedora, if `python3 -m venv` fails with "ensurepip is not available",
+> install it first: `sudo dnf install python3-pip`. The Audio Notes feature's
+> `edge-tts`/`mutagen` dependencies need no extra system packages beyond Python.
 
 ---
 
