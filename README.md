@@ -56,9 +56,13 @@ uses Gemini (long-form generation isn't reliable on the other providers).
 2. In the SQL editor, run `CA_APP/schema.sql` to create the base tables.
 3. Run `CA_APP/migration_002_cpa_exam.sql` to add the CPA Simulation Exam
    tables.
-4. Run `CA_APP/migration_004_audio_episodes.sql` to add the Audio Notes
+4. Run `CA_APP/migration_003_simulation_items.sql` to add the structured
+   simulation sub-item (TBS) tables.
+5. Run `CA_APP/migration_004_audio_episodes.sql` to add the Audio Notes
    table (optional, only needed for the Audio Notes feature).
-5. Get your connection string (Project Settings → Database → Connection
+6. Run `CA_APP/migration_005_chapter_syllabus_section.sql` to add the
+   `syllabus_section` column used by the Study Priority analytics view.
+7. Get your connection string (Project Settings → Database → Connection
    string → use the **pooler** connection for IPv4 compatibility).
 
 ---

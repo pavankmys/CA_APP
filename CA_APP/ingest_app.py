@@ -12,10 +12,12 @@ from database import (
     get_mock_bank_summary, remove_duplicate_mock_mcqs,
     get_or_create_chapter, save_audio_episode, get_episodes_for_chapter,
     get_all_episodes_for_feed, get_audio_episode_summary, delete_audio_episode,
+    get_subject_list, get_chapters_with_sections, set_chapter_syllabus_section,
 )
 from parser import extract_text_chunks, generate_from_chunk, generate_mock_mcqs_from_chunk, generate_simulations_from_chunk
 import audio_notes
 import audio_publish
+import icai_syllabus
 
 load_dotenv()
 
@@ -29,7 +31,7 @@ _provider_models = {
     "gemini":  "gemini-2.5-flash",
     "claude":  "claude-haiku-4-5",
     "grok":    "grok-3-mini",
-    "kimchi":  "kimi-k2.5",
+    "kimchi":  "kimi-k2.6",
 }
 st.sidebar.info(
     f"**AI Provider:** {provider.upper()}  \n"
@@ -537,3 +539,61 @@ with st.expander("Manage Audio Notes", expanded=False):
                 st.rerun()
         else:
             st.caption("No episodes to delete.")
+
+# ── Chapter Syllabus Weightage ───────────────────────────────────────────────
+st.divider()
+st.header("📚 Chapter Syllabus Weightage")
+st.caption(
+    "Tag each chapter with its ICAI syllabus section so the Analytics tab can "
+    "rank chapters by exam weightage. New chapters are auto-tagged where possible; "
+    "use this to review or correct the tag."
+)
+
+syllabus_subjects = get_subject_list()
+if not syllabus_subjects:
+    st.info("No subjects yet. Upload a PDF above to get started.")
+else:
+    syllabus_subject = st.selectbox("Subject", syllabus_subjects, key="syllabus_subject")
+    syllabus_paper = icai_syllabus.infer_paper(syllabus_subject)
+
+    if not syllabus_paper:
+        st.warning(
+            f"'{syllabus_subject}' is not mapped to a known ICAI paper, so no syllabus "
+            "sections are available for it."
+        )
+    else:
+        st.caption(f"Mapped to ICAI paper: **{syllabus_paper}**")
+        chapters_with_sections = get_chapters_with_sections(syllabus_subject)
+        if not chapters_with_sections:
+            st.info("No chapters yet for this subject.")
+        else:
+            options = icai_syllabus.section_options(syllabus_paper)
+            option_codes = [code for code, _ in options]
+            option_labels = {code: label for code, label in options}
+
+            chapter_choice = st.selectbox(
+                "Chapter",
+                chapters_with_sections,
+                format_func=lambda row: row[1],
+                key="syllabus_chapter",
+            )
+            chapter_id, chapter_name, current_section = chapter_choice
+
+            if current_section in option_codes:
+                default_index = option_codes.index(current_section)
+            else:
+                suggested = icai_syllabus.suggest_section(syllabus_paper, chapter_name)
+                default_index = option_codes.index(suggested) if suggested in option_codes else 0
+
+            selected_code = st.selectbox(
+                "Syllabus section",
+                option_codes,
+                index=default_index,
+                format_func=lambda code: option_labels[code],
+                key="syllabus_section_select",
+            )
+
+            if st.button("Save Section", type="primary"):
+                set_chapter_syllabus_section(chapter_id, selected_code)
+                st.success(f"Saved: {chapter_name} → {option_labels[selected_code]}")
+                st.rerun()

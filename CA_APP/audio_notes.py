@@ -1,7 +1,8 @@
 """
-Audio Notes pipeline — converts a chapter PDF into ~20-30 min spoken-explainer episodes.
+Audio Notes pipeline — converts a chapter PDF into ONE ~20-22 min high-level spoken
+OVERVIEW episode (conceptual summary; worked examples are intentionally skipped).
 
-For each chunk of the chapter:
+For the chapter:
   1. generate_episode_script() — Gemini rewrites the chunk as a spoken-language script
      with a leading "TITLE: ..." line
   2. verify_script() — separate Gemini pass checks the script against the source for
@@ -15,53 +16,75 @@ import asyncio
 import math
 
 import edge_tts
-import google.generativeai as genai
+from google.genai import types
 
+import gemini_cost
 import parser as pdf_parser
 
-AUDIO_CHUNK_SIZE = 14000  # chars per episode — 23.9K chars produced a 47-min episode (5785
-# words), 9.5K chars produced a 25-min episode (3798 words); content density varies a lot
-# (worked examples expand more), so 14K aims for the 20-30 min target across both extremes
+AUDIO_CHUNK_SIZE = 400000  # effectively "whole chapter in one call" — the note is now a
+# single high-level OVERVIEW episode per chapter, not a full rewrite. Gemini 2.5 Flash
+# (1M-token context) comfortably takes an entire ICAI chapter; the prompt caps output
+# at ~3,000-3,300 words (~20-22 min at 150 wpm) regardless of input length.
 MIN_FINAL_CHUNK_CHARS = 5000  # merge a trailing chunk smaller than this into the previous one
-MAX_EPISODE_WORDS = 4500  # ~30 min at 150wpm — scripts longer than this get split into
-# multiple episodes at paragraph boundaries (content density varies too much per input
-# chunk to control episode length via chunk size alone)
+MAX_EPISODE_WORDS = 4000  # safety net (~26 min at 150wpm) — if the model overshoots the
+# target length, the script gets split at paragraph boundaries rather than producing
+# one over-long episode
 DEFAULT_VOICE = "en-IN-NeerjaNeural"
+
+_BLOCK_NONE_SAFETY_SETTINGS = [
+    types.SafetySetting(category=category, threshold=types.HarmBlockThreshold.BLOCK_NONE)
+    for category in (
+        types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    )
+]
 
 KIMCHI_BASE_URL = "https://llm.kimchi.dev/openai/v1"
 KIMCHI_MODEL = "kimi-k2.5"
 
-SCRIPT_SYSTEM_INSTRUCTION = """You are an experienced CA Inter faculty member recording audio study \
-notes for students to listen to during their daily commute.
+SCRIPT_SYSTEM_INSTRUCTION = """You are an experienced CA Inter faculty member recording a single \
+HIGH-LEVEL AUDIO OVERVIEW of a chapter, for students to listen to during their daily commute. \
+This is NOT a full rewrite of the material — it is a conceptual summary that gives the student \
+a mental map of the chapter before (or after) they read it in detail.
 
 First, output a single line in the exact format:
-TITLE: <a concise 4-8 word topic title for this segment>
+TITLE: <a concise 4-8 word topic title for this chapter>
 
-Then, on the following lines, rewrite the given ICAI study material as a natural, \
-spoken-language script of approximately 3,500-4,000 words. Follow these rules:
+Then, on the following lines, write a natural, spoken-language overview script of \
+approximately 3,000-3,300 words (this yields a 20-22 minute episode — do NOT exceed this, \
+no matter how long the source material is). Follow these rules:
 
 1. Conversational, teacher-explaining-to-a-student tone — like a lecture, not a textbook.
-2. Expand every abbreviation, section number, and standard reference the first time it's \
+2. Cover the chapter at a CONCEPTUAL level only: what each topic is, why it exists, the key \
+rules/provisions/principles, how the pieces relate to each other, and what is exam-relevant. \
+Allocate words to topics in proportion to their importance, not their page count.
+3. SKIP the worked examples, illustrations, and practice problems in the source material \
+entirely. Do not narrate any step-by-step calculations. At most, mention in one sentence \
+what kind of problems the chapter's examples cover (e.g. "the chapter then works through \
+illustrations on computing depreciation under both methods — practice those on paper").
+4. State the most important numbers, thresholds, rates, and section/standard references — \
+the ones a student must remember — but do not enumerate every figure in the source.
+5. Expand every abbreviation, section number, and standard reference the first time it's \
 mentioned (e.g. "Section 44AD of the Income Tax Act").
-3. Describe tables, formulas, and journal entries entirely in words — never assume the \
-listener can see anything.
-4. Walk through worked examples step by step, narrating the numbers and reasoning aloud.
-5. Use short sentences, verbal transitions ("Now,", "Next,", "Let's move to..."), and \
+6. Describe any essential formula or rule entirely in words — never assume the listener \
+can see anything.
+7. Use short sentences, verbal transitions ("Now,", "Next,", "Let's move to..."), and \
 occasional rhetorical questions to keep attention.
-6. Do not use bullet points, headings, markdown, or any visual formatting — output pure \
+8. Do not use bullet points, headings, markdown, or any visual formatting — output pure \
 spoken prose only (after the TITLE line).
-7. Begin with one sentence introducing what this segment covers, and end with a short \
-one or two sentence recap of the key takeaway.
-8. Stay strictly faithful to the source material's facts, figures, provisions, and \
-numbers — do not invent or alter any of them. If a calculation needs a number that is \
-not given in the source, describe the method generally without inventing a figure.
+9. Begin with one or two sentences giving a roadmap of what this chapter covers, and end \
+with a short recap of the three to five key takeaways.
+10. Stay strictly faithful to the source material's facts, figures, provisions, and \
+numbers — do not invent or alter any of them.
 """
 
 VERIFY_SYSTEM_INSTRUCTION = """You are a meticulous fact-checker reviewing an audio script \
-generated from ICAI CA Inter study material. The script is a SPOKEN-LANGUAGE REWRITE meant to \
-teach the same material — it is EXPECTED to paraphrase, add verbal transitions, and include \
-illustrative explanations of *why* a rule works. Your job is to catch FACTUAL ERRORS, not \
-stylistic elaboration.
+generated from ICAI CA Inter study material. The script is a CONDENSED, HIGH-LEVEL SPOKEN \
+OVERVIEW of the material — it is EXPECTED to omit most of the source (especially worked \
+examples and illustrations), paraphrase heavily, add verbal transitions, and explain *why* \
+rules work. Your job is to catch FACTUAL ERRORS, not omissions or stylistic elaboration.
 
 You will be given SOURCE TEXT (the original study material) and a GENERATED SCRIPT (a spoken \
 rewrite of it).
@@ -75,7 +98,9 @@ that contradicts the source (wrong number, or a reference inconsistent with the 
 the source, presented as if it were part of the source material
 - A statement about accounting, tax, audit, or legal treatment that CONTRADICTS the source
 
-Do NOT flag (these are expected and desirable in a spoken rewrite):
+Do NOT flag (these are expected and desirable in a condensed spoken overview):
+- Omission of any source content — examples, illustrations, tables, sub-topics, or figures \
+left out of the script are intentional, never an issue
 - Paraphrasing or restating a rule in different words
 - Illustrative examples that name a general category of item (e.g. "custom-made jewellery" as \
 an example of a unique high-value item) without inventing source-like data
@@ -131,17 +156,21 @@ def _parse_title(text):
 
 
 def _generate_episode_script_gemini(source_text, api_key):
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=SCRIPT_SYSTEM_INSTRUCTION,
-    )
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
     prompt = f"Source material:\n\n{source_text}\n\nWrite the script now."
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(temperature=0.1),
-        safety_settings="BLOCK_NONE",
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SCRIPT_SYSTEM_INSTRUCTION,
+            temperature=0.1,
+            safety_settings=_BLOCK_NONE_SAFETY_SETTINGS,
+            http_options=types.HttpOptions(timeout=180_000),
+        ),
     )
+    gemini_cost.record("audio_script_gen", response.usage_metadata)
     return _parse_title(_extract_gemini_text(response).strip())
 
 
@@ -211,21 +240,25 @@ def generate_episode_script(source_text, api_key, provider="gemini"):
 
 
 def _verify_script_gemini(source_text, script_text, api_key):
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=VERIFY_SYSTEM_INSTRUCTION,
-    )
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
     prompt = (
         f"SOURCE TEXT:\n\n{source_text}\n\n"
         f"GENERATED SCRIPT:\n\n{script_text}\n\n"
         f"List any unverifiable claims now."
     )
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(temperature=0.0),
-        safety_settings="BLOCK_NONE",
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=VERIFY_SYSTEM_INSTRUCTION,
+            temperature=0.0,
+            safety_settings=_BLOCK_NONE_SAFETY_SETTINGS,
+            http_options=types.HttpOptions(timeout=180_000),
+        ),
     )
+    gemini_cost.record("audio_verify", response.usage_metadata)
     report = _extract_gemini_text(response).strip()
     return report == "NO CRITICAL ISSUES", report
 

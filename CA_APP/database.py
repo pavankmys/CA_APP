@@ -1,5 +1,6 @@
 import os
 import datetime
+import itertools
 import json
 import random
 import re
@@ -7,6 +8,8 @@ import re
 import psycopg2
 import psycopg2.extensions
 from dotenv import load_dotenv
+
+import icai_syllabus
 
 load_dotenv()
 
@@ -791,6 +794,34 @@ def get_analytics_data():
     ''')
     daily_trend = [(d.isoformat(), score) for d, score in cursor.fetchall()]
 
+    # ── Daily activity (question count) for streak/consistency heatmap ────────
+    cursor.execute('''
+        SELECT reviewed_at, COUNT(*)
+        FROM practice_log
+        WHERE reviewed_at >= CURRENT_DATE - INTERVAL '34 days'
+        GROUP BY reviewed_at
+        ORDER BY reviewed_at
+    ''')
+    daily_activity = [(d.isoformat(), n) for d, n in cursor.fetchall()]
+
+    # ── Speed vs accuracy by difficulty ────────────────────────────────────────
+    cursor.execute('''
+        SELECT
+            COALESCE(m.difficulty, 'medium') AS difficulty,
+            COUNT(*) AS total,
+            SUM(CASE WHEN pl.srs_rating >= 3 THEN 1 ELSE 0 END) AS correct,
+            ROUND(AVG(CASE WHEN pl.srs_rating >= 3 THEN pl.time_spent_seconds END), 1) AS avg_time_correct,
+            ROUND(AVG(CASE WHEN pl.srs_rating < 3 THEN pl.time_spent_seconds END), 1) AS avg_time_incorrect
+        FROM practice_log pl
+        JOIN mcqs m ON m.id = pl.mcq_id
+        WHERE m.is_retired = 0
+        GROUP BY COALESCE(m.difficulty, 'medium')
+        ORDER BY CASE COALESCE(m.difficulty, 'medium')
+            WHEN 'easy' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+    ''')
+    speed_accuracy = cursor.fetchall()
+    # (difficulty, total, correct, avg_time_correct, avg_time_incorrect)
+
     # ── Chapter performance with confidence score ──────────────────────────────
     cursor.execute('''
         SELECT
@@ -801,7 +832,8 @@ def get_analytics_data():
             COALESCE(SUM(pl_agg.total_reviews), 0)    AS total_reviews,
             COALESCE(SUM(pl_agg.correct_reviews), 0)  AS correct_reviews,
             SUM(CASE WHEN s.next_review <= %s THEN 1 ELSE 0 END) AS due_count,
-            COALESCE(SUM(pl_agg.total_time_sec), 0)   AS total_time_sec
+            COALESCE(SUM(pl_agg.total_time_sec), 0)   AS total_time_sec,
+            c.syllabus_section                        AS syllabus_section
         FROM chapters c
         JOIN subjects sub ON c.subject_id = sub.id
         JOIN mcqs m ON m.chapter_id = c.id
@@ -815,11 +847,46 @@ def get_analytics_data():
             GROUP BY mcq_id
         ) pl_agg ON pl_agg.mcq_id = m.id
         WHERE m.is_retired = 0
-        GROUP BY c.id, sub.name, c.name
+        GROUP BY c.id, sub.name, c.name, c.syllabus_section
         ORDER BY sub.name, c.name
     ''', (today,))
     chapter_perf = cursor.fetchall()
-    # (subject, chapter, total_mcqs, avg_ease, total_reviews, correct_reviews, due_count, total_time_sec)
+    # (subject, chapter, total_mcqs, avg_ease, total_reviews, correct_reviews, due_count, total_time_sec, syllabus_section)
+
+    # ── Lapse detection: questions that were "learned" (2+ consecutive good
+    # reviews) and were then answered incorrectly again ──────────────────────
+    cursor.execute('''
+        SELECT sub.name, c.name, pl.mcq_id, pl.reviewed_at, pl.srs_rating
+        FROM practice_log pl
+        JOIN mcqs m ON m.id = pl.mcq_id
+        JOIN chapters c ON c.id = m.chapter_id
+        JOIN subjects sub ON sub.id = c.subject_id
+        WHERE m.is_retired = 0
+        ORDER BY pl.mcq_id, pl.id
+    ''')
+    review_rows = cursor.fetchall()
+
+    lapse_cutoff = today - datetime.timedelta(days=30)
+    lapses_by_chapter = {}  # (subject, chapter) -> {'count': int, 'latest': date}
+    for mcq_id, group in itertools.groupby(review_rows, key=lambda r: r[2]):
+        streak = 0
+        for subject, chapter, _mcq_id, reviewed_at, rating in group:
+            if rating is not None and rating < 3:
+                if streak >= 2 and reviewed_at >= lapse_cutoff:
+                    entry = lapses_by_chapter.setdefault((subject, chapter), {'count': 0, 'latest': reviewed_at})
+                    entry['count'] += 1
+                    entry['latest'] = max(entry['latest'], reviewed_at)
+                streak = 0
+            else:
+                streak += 1
+
+    recent_lapses = [
+        (subject, chapter, info['count'], info['latest'])
+        for (subject, chapter), info in lapses_by_chapter.items()
+    ]
+    recent_lapses.sort(key=lambda r: r[3], reverse=True)
+    recent_lapses = recent_lapses[:8]
+    # (subject, chapter, lapse_count, most_recent_lapse_date)
 
     cursor.close()
     return {
@@ -832,7 +899,10 @@ def get_analytics_data():
         'trending_current': current_score,
         'trending_prev':    prev_score,
         'trending_daily':   daily_trend,
+        'daily_activity':   daily_activity,
+        'speed_accuracy':   speed_accuracy,
         'chapter_perf':     chapter_perf,
+        'recent_lapses':    recent_lapses,
     }
 
 
@@ -976,15 +1046,42 @@ def get_or_create_chapter(subject_name, chapter_name):
     cursor.execute("SELECT id FROM subjects WHERE name = %s", (subject_name,))
     subject_id = cursor.fetchone()[0]
 
+    paper = icai_syllabus.infer_paper(subject_name)
+    syllabus_section = icai_syllabus.suggest_section(paper, chapter_name) if paper else None
+
     cursor.execute(
-        "INSERT INTO chapters (subject_id, name) VALUES (%s, %s) ON CONFLICT (subject_id, name) DO NOTHING",
-        (subject_id, chapter_name)
+        "INSERT INTO chapters (subject_id, name, syllabus_section) VALUES (%s, %s, %s) ON CONFLICT (subject_id, name) DO NOTHING",
+        (subject_id, chapter_name, syllabus_section)
     )
     cursor.execute("SELECT id FROM chapters WHERE subject_id = %s AND name = %s", (subject_id, chapter_name))
     chapter_id = cursor.fetchone()[0]
     conn.commit()
     cursor.close()
     return chapter_id
+
+
+def get_chapters_with_sections(subject_name):
+    """Returns [(chapter_id, chapter_name, syllabus_section), ...] for a subject, ordered by name."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT c.id, c.name, c.syllabus_section FROM chapters c
+        JOIN subjects sub ON c.subject_id = sub.id
+        WHERE sub.name = %s
+        ORDER BY c.name
+    ''', (subject_name,))
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+def set_chapter_syllabus_section(chapter_id, section_code):
+    """Sets (or clears, if section_code is None) the syllabus_section for a chapter."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE chapters SET syllabus_section = %s WHERE id = %s", (section_code, chapter_id))
+    conn.commit()
+    cursor.close()
 
 
 def save_audio_episode(chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes):

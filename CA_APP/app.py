@@ -1,5 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
+import pandas as pd
 import datetime
 import json
 import os
@@ -10,6 +11,7 @@ from database import (
     save_cpa_exam, get_cpa_exam_history,
     get_analytics_data, DIFFICULTY_POINTS, CPA_EXAM_MIN_MCQS, CPA_EXAM_MIN_SIMS,
 )
+import icai_syllabus
 
 st.set_page_config(page_title="CA Inter SRS Practice App", layout="wide")
 
@@ -85,7 +87,7 @@ st.title("📚 CA Inter Practice Engine")
 tab1, tab3, tab4 = st.tabs([
     "🎯 Daily Practice Deck",
     "📊 Analytics",
-    "📝 CPA Simulation Exam"
+    "📝 CA Simulation Exam"
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,6 +281,37 @@ with tab3:
     if total_h == 0:
         st.caption("Study time accumulates as you practice in the Daily Practice tab.")
 
+    # ══ SECTION 1.5: SPEED VS ACCURACY BY DIFFICULTY ══════════════════════════
+    speed_accuracy = data.get('speed_accuracy', [])
+    if speed_accuracy:
+        st.divider()
+        st.subheader("⏱️ Speed vs Accuracy by Difficulty")
+        st.caption(
+            "Avg Time (Correct) vs Avg Time (Wrong) — if wrong answers come noticeably "
+            "faster than right ones on a difficulty, that's a sign of rushing."
+        )
+        sa_rows = []
+        rushing_flags = []
+        for difficulty, total, correct, avg_time_correct, avg_time_incorrect in speed_accuracy:
+            acc = round((correct / total * 100), 1) if total else 0.0
+            sa_rows.append({
+                "Difficulty":          difficulty.title(),
+                "Reviews":             total,
+                "Accuracy":            f"{acc}%",
+                "Avg Time (Correct)":  f"{avg_time_correct}s" if avg_time_correct is not None else "—",
+                "Avg Time (Wrong)":    f"{avg_time_incorrect}s" if avg_time_incorrect is not None else "—",
+            })
+            if (avg_time_correct is not None and avg_time_incorrect is not None
+                    and avg_time_incorrect < avg_time_correct * 0.8 and acc < 60):
+                rushing_flags.append(difficulty.title())
+
+        st.table(sa_rows)
+        if rushing_flags:
+            st.warning(
+                f"On **{', '.join(rushing_flags)}** questions, wrong answers come noticeably "
+                "faster than right ones with accuracy below 60% — try slowing down before answering."
+            )
+
     # ══ SECTION 2: OVERALL READINESS SCORE ═══════════════════════════════════
     st.divider()
     st.subheader("Overall Readiness Score")
@@ -335,6 +368,70 @@ with tab3:
                 )
                 st.caption("Last 14 practice days  |  green >= 75%  |  orange >= 50%  |  red < 50%")
 
+    # ══ SECTION 2.5: STUDY STREAK & CONSISTENCY ═══════════════════════════════
+    st.divider()
+    st.subheader("🔥 Study Streak & Consistency")
+
+    daily_activity = data.get('daily_activity', [])
+    activity_by_date = {date_str: n for date_str, n in daily_activity}
+    today_date = datetime.date.today()
+
+    def _is_active(d):
+        return activity_by_date.get(d.isoformat(), 0) > 0
+
+    # Current streak: consecutive active days ending today (or yesterday, if
+    # today hasn't been studied yet so the streak isn't broken yet).
+    current_streak = 0
+    if _is_active(today_date) or _is_active(today_date - datetime.timedelta(days=1)):
+        cursor_date = today_date if _is_active(today_date) else today_date - datetime.timedelta(days=1)
+        while _is_active(cursor_date):
+            current_streak += 1
+            cursor_date -= datetime.timedelta(days=1)
+
+    # Longest streak and active-day count within the last 30 days.
+    longest_streak = 0
+    running = 0
+    active_days_30 = 0
+    for i in range(29, -1, -1):
+        d = today_date - datetime.timedelta(days=i)
+        if _is_active(d):
+            running += 1
+            active_days_30 += 1
+            longest_streak = max(longest_streak, running)
+        else:
+            running = 0
+
+    sc1, sc2, sc3 = st.columns(3)
+    sc1.metric("Current Streak", f"{current_streak} day{'s' if current_streak != 1 else ''}")
+    sc2.metric("Longest Streak (30d)", f"{longest_streak} day{'s' if longest_streak != 1 else ''}")
+    sc3.metric("Active Days (30d)", f"{active_days_30}/30")
+
+    # Heatmap strip: last 35 days, one square per day, colored by question count.
+    squares = ""
+    for i in range(34, -1, -1):
+        d = today_date - datetime.timedelta(days=i)
+        count = activity_by_date.get(d.isoformat(), 0)
+        if count == 0:
+            color = "#2b2b2b"
+        elif count <= 2:
+            color = "#1b4332"
+        elif count <= 5:
+            color = "#2d6a4f"
+        elif count <= 10:
+            color = "#40916c"
+        else:
+            color = "#52b788"
+        squares += (
+            f'<div style="display:inline-block;width:14px;height:14px;margin:1px;'
+            f'border-radius:2px;background:{color};" '
+            f'title="{d.isoformat()}: {count} question(s)"></div>'
+        )
+    components.html(
+        f'<div style="display:flex;flex-wrap:wrap;align-items:center;">{squares}</div>',
+        height=40, scrolling=False
+    )
+    st.caption("Last 35 days  |  darker = more questions answered that day")
+
     # ══ SECTION 3: CHAPTER PERFORMANCE & CONFIDENCE ══════════════════════════
     st.divider()
     st.subheader("Chapter Performance & Confidence")
@@ -349,7 +446,7 @@ with tab3:
     else:
         ch_rows = []
         for row in chapter_perf:
-            subject, chapter, total_q, avg_ease, total_rev, correct_rev, due_cnt, time_sec = row
+            subject, chapter, total_q, avg_ease, total_rev, correct_rev, due_cnt, time_sec, syllabus_section = row
             conf    = _confidence_score(avg_ease or 2.5, total_rev, correct_rev)
             acc     = round((correct_rev / total_rev * 100), 1) if total_rev else 0.0
             hours_c = round((time_sec or 0) / 3600.0, 1)
@@ -367,11 +464,107 @@ with tab3:
         ch_rows.sort(key=lambda r: float(r["Confidence"].rstrip("%")))
         st.table(ch_rows)
 
-    # ══ SECTION 4: CPA EXAM HISTORY ════════════════════════════════════════════
+    # ══ SECTION 3.5: STUDY PRIORITY (EXAM-WEIGHTED) ══════════════════════════
+    st.divider()
+    st.subheader("📌 Study Priority (Exam-Weighted)")
+    st.caption(
+        "Priority = (100 - Confidence) × Exam Weight%. Combines how much a chapter is "
+        "worth on the exam with how far you are from mastering it — highest priority first."
+    )
+
+    if not chapter_perf:
+        st.info("No chapters found. Ingest study materials first.")
+    else:
+        priority_rows = []
+        untagged_count = 0
+        for row in chapter_perf:
+            subject, chapter, total_q, avg_ease, total_rev, correct_rev, due_cnt, time_sec, syllabus_section = row
+            paper  = icai_syllabus.infer_paper(subject)
+            weight = icai_syllabus.section_weight(paper, syllabus_section) if (paper and syllabus_section) else None
+            if weight is None:
+                untagged_count += 1
+                continue
+            conf = _confidence_score(avg_ease or 2.5, total_rev, correct_rev)
+            priority_rows.append({
+                "Subject":     subject,
+                "Chapter":     chapter,
+                "Exam Weight": f"{weight:g}%",
+                "Confidence":  f"{conf}%",
+                "Priority":    round((100 - conf) * weight, 1),
+            })
+
+        if not priority_rows:
+            st.info("No chapters tagged with a syllabus section yet — tag them in the ingest app.")
+        else:
+            priority_rows.sort(key=lambda r: r["Priority"], reverse=True)
+            st.table(priority_rows[:8])
+
+        if untagged_count:
+            st.caption(
+                f"{untagged_count} chapter(s) not yet tagged with a syllabus section — "
+                "tag them in the ingest app for a complete ranking."
+            )
+
+    # ══ SECTION 3.6: SYLLABUS COVERAGE ════════════════════════════════════════
+    st.divider()
+    st.subheader("📋 Syllabus Coverage")
+    st.caption(
+        "Share of each paper's exam weightage for which you have practice content, "
+        "based on the ICAI syllabus sections tagged in the ingest app."
+    )
+
+    if not chapter_perf:
+        st.info("No chapters found. Ingest study materials first.")
+    else:
+        covered_by_paper = {}
+        for row in chapter_perf:
+            subject, chapter, total_q, avg_ease, total_rev, correct_rev, due_cnt, time_sec, syllabus_section = row
+            paper = icai_syllabus.infer_paper(subject)
+            if not paper or not syllabus_section or not total_q:
+                continue
+            covered_by_paper.setdefault(paper, set()).add(syllabus_section)
+
+        if not covered_by_paper:
+            st.info("No tagged chapters with content yet — tag chapters in the ingest app.")
+        else:
+            for paper, covered_sections in covered_by_paper.items():
+                sections = icai_syllabus.SYLLABUS_WEIGHTAGE[paper]
+                total_weight = sum(weight for _label, weight in sections.values())
+                covered_weight = sum(weight for code, (_label, weight) in sections.items() if code in covered_sections)
+                coverage_pct = round(covered_weight / total_weight * 100, 1) if total_weight else 0.0
+
+                st.markdown(f"**{paper}** — {coverage_pct}% of exam weight covered "
+                            f"({len(covered_sections)}/{len(sections)} sections)")
+                st.progress(min(coverage_pct / 100.0, 1.0))
+
+    # ══ SECTION 3.7: RECENTLY LAPSED CHAPTERS ═════════════════════════════════
+    st.divider()
+    st.subheader("⚠️ Recently Lapsed Chapters")
+    st.caption(
+        "Questions you'd learned (2+ good reviews in a row) but then got wrong again "
+        "in the last 30 days — a sign a chapter needs revisiting before it's forgotten."
+    )
+
+    recent_lapses = data.get('recent_lapses', [])
+    if not recent_lapses:
+        st.success("No recent lapses — chapters you've learned are holding up well.")
+    else:
+        lapse_rows = [
+            {
+                "Subject":          subject,
+                "Chapter":          chapter,
+                "Lapsed Questions": lapse_count,
+                "Most Recent":      str(latest),
+            }
+            for subject, chapter, lapse_count, latest in recent_lapses
+        ]
+        st.table(lapse_rows)
+
+    # ══ SECTION 4: CA EXAM HISTORY ═════════════════════════════════════════════
     exam_history = data.get('exam_history', [])
     if exam_history:
         st.divider()
-        st.subheader("CPA Exam History")
+        st.subheader("CA Exam History")
         exam_rows = []
         for row in exam_history:
             date, subj, mcq_pct, sim_pct, overall_pct, proficient, mcq_total, sim_total = row
@@ -388,11 +581,29 @@ with tab3:
             })
         st.table(exam_rows)
 
+        # ── MCQ vs Simulation trend ─────────────────────────────────────────
+        if len(exam_history) >= 2:
+            st.markdown("**MCQ % vs Simulation % over time**")
+            st.caption(
+                "Are MCQ knowledge and practical (simulation) application improving together, "
+                "or is one lagging behind?"
+            )
+            trend_rows = []
+            for row in reversed(exam_history):  # chronological order
+                date, subj, mcq_pct, sim_pct, overall_pct, proficient, mcq_total, sim_total = row
+                trend_rows.append({
+                    "Attempt":  f"{date} ({subj})",
+                    "MCQ %":    float(mcq_pct or 0),
+                    "Sim %":    float(sim_pct or 0),
+                })
+            trend_df = pd.DataFrame(trend_rows).set_index("Attempt")
+            st.line_chart(trend_df)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 4: MOCK TEST
 # ─────────────────────────────────────────────────────────────────────────────
 with tab4:
-    st.header("CPA Simulation Exam")
+    st.header("CA Simulation Exam")
     st.caption(
         "MCQ section: Easy = 1pt | Medium = 2pts | Hard = 3pts (weighted %). "
         "Simulation section: simple correct/total %. "
@@ -442,7 +653,7 @@ with tab4:
                 if mock_mcq_count < num_q:
                     st.warning(f"Only {mock_mcq_count} mock MCQs available — exam will use all of them.")
 
-                if st.button("🚀 Start CPA Simulation Exam", type="primary", use_container_width=True):
+                if st.button("🚀 Start CA Simulation Exam", type="primary", use_container_width=True):
                     questions = get_cpa_exam_mcqs(selected, num_q)
                     sims = get_cpa_exam_simulations(selected)
                     if not questions or not sims:
@@ -463,7 +674,7 @@ with tab4:
         history = get_cpa_exam_history(limit=5)
         if history:
             st.divider()
-            st.subheader("Recent CPA Exams")
+            st.subheader("Recent CA Exams")
             for row in history:
                 _, subj, date, mcq_pct, sim_pct, overall_pct, proficient, mcq_total, sim_total, secs = row
                 badge = "✅" if proficient else "❌"

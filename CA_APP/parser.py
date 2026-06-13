@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 from typing import List, Literal
 from dotenv import load_dotenv
 
+import gemini_cost
+
 load_dotenv()
 
 CHUNK_SIZE = 40000  # ~23 pages of CA Inter content per chunk
@@ -707,22 +709,24 @@ def extract_text_chunks(file_bytes, chunk_size=CHUNK_SIZE):
 
 # ── Provider implementations ──────────────────────────────────────────────────
 
-def _generate_with_gemini(text, api_key, mcq_count, subject, chapter, system_instruction=SYSTEM_INSTRUCTION):
-    import google.generativeai as genai
+def _generate_with_gemini(text, api_key, mcq_count, subject, chapter, system_instruction=SYSTEM_INSTRUCTION,
+                           usage_label="mcq_gen"):
+    from google import genai
+    from google.genai import types
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=system_instruction
-    )
-    response = model.generate_content(
-        _build_user_prompt(subject, chapter, mcq_count, text),
-        generation_config=genai.types.GenerationConfig(
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=_build_user_prompt(subject, chapter, mcq_count, text),
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
             response_mime_type="application/json",
             response_schema=MCQBank,
-            temperature=0.1
-        )
+            temperature=0.1,
+            http_options=types.HttpOptions(timeout=120_000),
+        ),
     )
+    gemini_cost.record(usage_label, response.usage_metadata)
     data = json.loads(response.text)
     return _validate_mcqs(data.get("mcqs", []))
 
@@ -826,21 +830,23 @@ def _generate_with_kimchi(text, api_key, mcq_count, subject, chapter, system_ins
 
 
 def _generate_sim_with_gemini(text, api_key, sim_count, subject, chapter):
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=SIM_SYSTEM_INSTRUCTION
-    )
-    response = model.generate_content(
-        _build_sim_user_prompt(subject, chapter, sim_count, text),
-        generation_config=genai.types.GenerationConfig(
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=_build_sim_user_prompt(subject, chapter, sim_count, text),
+        config=types.GenerateContentConfig(
+            system_instruction=SIM_SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
             response_schema=SimulationBank,
-            temperature=0.1
-        )
+            temperature=0.1,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            http_options=types.HttpOptions(timeout=120_000),
+        ),
     )
+    gemini_cost.record("sim_gen", response.usage_metadata)
     data = json.loads(response.text)
     return _validate_simulations(data.get("simulations", []))
 
@@ -987,7 +993,8 @@ def generate_mock_mcqs_from_chunk(chunk_text, api_key, mcq_count, provider=None,
                                       system_instruction=MOCK_SYSTEM_INSTRUCTION)
     else:
         return _generate_with_gemini(chunk_text, api_key, mcq_count, subject, chapter,
-                                      system_instruction=MOCK_SYSTEM_INSTRUCTION)
+                                      system_instruction=MOCK_SYSTEM_INSTRUCTION,
+                                      usage_label="mock_mcq_gen")
 
 
 def generate_simulations_from_chunk(chunk_text, api_key, sim_count=1, provider=None, subject="", chapter=""):
