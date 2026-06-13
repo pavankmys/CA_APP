@@ -155,6 +155,21 @@ def _parse_title(text):
     return title, text
 
 
+def script_to_markdown(title, script_text):
+    """Returns an episode script as an editable markdown document with a leading
+    '# Title' heading."""
+    return f"# {title}\n\n{script_text}"
+
+
+def markdown_to_script(markdown_text):
+    """Returns (title, script_text) from a markdown document produced by
+    `script_to_markdown`. title is None if the text has no leading '# ' heading."""
+    first_line, _, rest = markdown_text.partition("\n")
+    if first_line.startswith("# "):
+        return first_line[2:].strip(), rest.strip()
+    return None, markdown_text.strip()
+
+
 def _generate_episode_script_gemini(source_text, api_key):
     from google import genai
 

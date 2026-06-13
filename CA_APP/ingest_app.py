@@ -12,6 +12,7 @@ from database import (
     get_mock_bank_summary, remove_duplicate_mock_mcqs,
     get_or_create_chapter, save_audio_episode, get_episodes_for_chapter,
     get_all_episodes_for_feed, get_audio_episode_summary, delete_audio_episode,
+    update_audio_episode_media,
     get_subject_list, get_chapters_with_sections, set_chapter_syllabus_section,
 )
 from parser import extract_text_chunks, generate_from_chunk, generate_mock_mcqs_from_chunk, generate_simulations_from_chunk
@@ -455,6 +456,15 @@ if st.button("Generate Audio Notes", type="primary"):
                 continue
 
             for ep_title, ep_script in audio_notes.split_script_into_episodes(title, script):
+                storage_path = f"{_slugify(subj)}/{_slugify(chap)}/episode_{next_episode_num:03d}.mp3"
+                notes_storage_path = f"{_slugify(subj)}/{_slugify(chap)}/episode_{next_episode_num:03d}.md"
+
+                status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — saving notes for '{ep_title}'...")
+                notes_url = audio_publish.upload_text_file(
+                    r2_client, r2_bucket, r2_public_url,
+                    audio_notes.script_to_markdown(ep_title, ep_script), notes_storage_path
+                )
+
                 status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — synthesizing audio for '{ep_title}'...")
                 with tempfile.TemporaryDirectory() as tmpdir:
                     mp3_path = os.path.join(tmpdir, "episode.mp3")
@@ -462,7 +472,6 @@ if st.button("Generate Audio Notes", type="primary"):
                     duration = audio_notes.get_audio_duration_seconds(mp3_path)
                     file_size = os.path.getsize(mp3_path)
 
-                    storage_path = f"{_slugify(subj)}/{_slugify(chap)}/episode_{next_episode_num:03d}.mp3"
                     status.text(f"⚙️  Chunk {i + 1} of {len(chunks)} — uploading '{ep_title}'...")
                     audio_url = audio_publish.upload_audio_file(
                         r2_client, r2_bucket, r2_public_url, mp3_path, storage_path
@@ -470,7 +479,7 @@ if st.button("Generate Audio Notes", type="primary"):
 
                 save_audio_episode(
                     chapter_id, next_episode_num, ep_title, audio_url,
-                    duration, len(ep_script.split()), file_size
+                    duration, len(ep_script.split()), file_size, notes_url
                 )
                 saved.append((next_episode_num, ep_title, duration))
                 next_episode_num += 1
@@ -539,6 +548,86 @@ with st.expander("Manage Audio Notes", expanded=False):
                 st.rerun()
         else:
             st.caption("No episodes to delete.")
+
+# ── Edit Notes & Regenerate Audio ───────────────────────────────────────────
+with st.expander("✏️ Edit Notes & Regenerate Audio", expanded=False):
+    st.caption(
+        "Edit an episode's saved markdown script and regenerate just its audio — no PDF "
+        "or AI re-generation needed, so notes can be corrected or extended independently "
+        "of the ICAI source material."
+    )
+    if not r2_configured:
+        st.warning("R2 configuration is missing in `.env` — see warning above.")
+    else:
+        edit_summary = get_audio_episode_summary()
+        if not edit_summary:
+            st.info("No audio episodes yet.")
+        else:
+            chapter_options = {f"{subj} › {chap}": (subj, chap) for subj, chap, _count, _secs in edit_summary}
+            chapter_choice = st.selectbox("Chapter", list(chapter_options.keys()), key="edit_notes_chapter")
+            edit_subj, edit_chap = chapter_options[chapter_choice]
+            edit_chapter_id = get_or_create_chapter(edit_subj, edit_chap)
+            episodes_with_notes = [ep for ep in get_episodes_for_chapter(edit_chapter_id) if ep[7]]
+
+            if not episodes_with_notes:
+                st.info(
+                    "No episodes with saved notes for this chapter — notes are only saved for "
+                    "episodes generated after this feature was added. Regenerate the chapter "
+                    "above to create notes for it."
+                )
+            else:
+                episode_options = {f"Episode {ep[1]}: {ep[2]}": ep for ep in episodes_with_notes}
+                episode_choice = st.selectbox("Episode", list(episode_options.keys()), key="edit_notes_episode")
+                ep_id, ep_num, ep_title, ep_audio_url, ep_duration, ep_word_count, ep_created, ep_notes_url = episode_options[episode_choice]
+
+                notes_path = audio_publish.storage_path_from_url(r2_public_url, ep_notes_url)
+                audio_path = audio_publish.storage_path_from_url(r2_public_url, ep_audio_url)
+
+                if st.session_state.get("edit_notes_loaded_id") != ep_id:
+                    edit_client = audio_publish.make_client(r2_account_id, r2_access_key_id, r2_secret_access_key)
+                    content = audio_publish.download_text_file(edit_client, r2_bucket, notes_path)
+                    st.session_state["edit_notes_content"] = content or ""
+                    st.session_state["edit_notes_loaded_id"] = ep_id
+
+                edited = st.text_area(
+                    "Notes (markdown)", value=st.session_state["edit_notes_content"],
+                    height=400, key="edit_notes_textarea"
+                )
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("💾 Save Notes to R2", key="edit_notes_save_btn"):
+                        edit_client = audio_publish.make_client(r2_account_id, r2_access_key_id, r2_secret_access_key)
+                        audio_publish.upload_text_file(edit_client, r2_bucket, r2_public_url, edited, notes_path)
+                        st.session_state["edit_notes_content"] = edited
+                        st.success("Notes saved to R2.")
+                with col2:
+                    if st.button("🔁 Regenerate Audio from Notes", type="primary", key="edit_notes_regen_btn"):
+                        new_title, new_script = audio_notes.markdown_to_script(edited)
+                        if not new_script.strip():
+                            st.error("Notes are empty — nothing to synthesize.")
+                        else:
+                            with st.spinner("Saving notes and synthesizing audio..."):
+                                edit_client = audio_publish.make_client(r2_account_id, r2_access_key_id, r2_secret_access_key)
+                                audio_publish.upload_text_file(edit_client, r2_bucket, r2_public_url, edited, notes_path)
+                                with tempfile.TemporaryDirectory() as tmpdir:
+                                    mp3_path = os.path.join(tmpdir, "episode.mp3")
+                                    asyncio.run(audio_notes.synthesize(new_script, audio_voice, mp3_path))
+                                    duration = audio_notes.get_audio_duration_seconds(mp3_path)
+                                    file_size = os.path.getsize(mp3_path)
+                                    audio_url = audio_publish.upload_audio_file(
+                                        edit_client, r2_bucket, r2_public_url, mp3_path, audio_path
+                                    )
+                                final_title = new_title or ep_title
+                                update_audio_episode_media(
+                                    ep_id, final_title, audio_url, duration, len(new_script.split()), file_size
+                                )
+                                st.session_state["edit_notes_content"] = edited
+                            st.success(
+                                f"Audio regenerated (~{duration // 60}m {duration % 60}s). "
+                                "Click **Publish Feed** above to update the podcast feed."
+                            )
+                            st.rerun()
 
 # ── Chapter Syllabus Weightage ───────────────────────────────────────────────
 st.divider()

@@ -36,6 +36,30 @@ def upload_audio_file(client, bucket, public_base_url, local_path, storage_path)
     return public_url(public_base_url, storage_path)
 
 
+def upload_text_file(client, bucket, public_base_url, content, storage_path):
+    """Uploads (or overwrites) a UTF-8 text file (e.g. markdown notes) to R2. Returns its public URL."""
+    client.put_object(Bucket=bucket, Key=storage_path, Body=content.encode("utf-8"), ContentType="text/markdown")
+    return public_url(public_base_url, storage_path)
+
+
+def download_text_file(client, bucket, storage_path):
+    """Downloads a UTF-8 text file from R2. Returns its content, or None if it doesn't exist."""
+    try:
+        obj = client.get_object(Bucket=bucket, Key=storage_path)
+    except client.exceptions.NoSuchKey:
+        return None
+    return obj["Body"].read().decode("utf-8")
+
+
+def storage_path_from_url(public_base_url, url):
+    """Returns the storage path (bucket key) for a public R2 URL, or None if `url` is
+    empty or doesn't match `public_base_url`."""
+    if not url:
+        return None
+    prefix = public_base_url.rstrip("/") + "/"
+    return url[len(prefix):] if url.startswith(prefix) else None
+
+
 def upload_feed_xml(client, bucket, public_base_url, xml_bytes, storage_path=FEED_PATH):
     """Uploads (or overwrites) feed.xml to R2. Returns its public URL."""
     client.put_object(Bucket=bucket, Key=storage_path, Body=xml_bytes, ContentType="application/rss+xml")

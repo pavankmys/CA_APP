@@ -62,7 +62,9 @@ uses Gemini (long-form generation isn't reliable on the other providers).
    table (optional, only needed for the Audio Notes feature).
 6. Run `CA_APP/migration_005_chapter_syllabus_section.sql` to add the
    `syllabus_section` column used by the Study Priority analytics view.
-7. Get your connection string (Project Settings → Database → Connection
+7. Run `CA_APP/migration_006_audio_notes_url.sql` to add the `notes_url`
+   column used by the Audio Notes edit-and-regenerate feature.
+8. Get your connection string (Project Settings → Database → Connection
    string → use the **pooler** connection for IPv4 compatibility).
 
 ---

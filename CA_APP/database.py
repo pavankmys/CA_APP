@@ -1084,27 +1084,41 @@ def set_chapter_syllabus_section(chapter_id, section_code):
     cursor.close()
 
 
-def save_audio_episode(chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes):
+def save_audio_episode(chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes, notes_url=None):
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO audio_episodes
-            (chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+            (chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes, notes_url)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
-    ''', (chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes))
+    ''', (chapter_id, episode_num, title, audio_url, duration_seconds, word_count, file_size_bytes, notes_url))
     episode_id = cursor.fetchone()[0]
     conn.commit()
     cursor.close()
     return episode_id
 
 
-def get_episodes_for_chapter(chapter_id):
-    """Returns [(id, episode_num, title, audio_url, duration_seconds, word_count, created_at), ...]."""
+def update_audio_episode_media(episode_id, title, audio_url, duration_seconds, word_count, file_size_bytes):
+    """Updates an existing episode's title and audio metadata after regenerating its
+    audio from edited markdown notes."""
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT id, episode_num, title, audio_url, duration_seconds, word_count, created_at
+        UPDATE audio_episodes
+        SET title = %s, audio_url = %s, duration_seconds = %s, word_count = %s, file_size_bytes = %s
+        WHERE id = %s
+    ''', (title, audio_url, duration_seconds, word_count, file_size_bytes, episode_id))
+    conn.commit()
+    cursor.close()
+
+
+def get_episodes_for_chapter(chapter_id):
+    """Returns [(id, episode_num, title, audio_url, duration_seconds, word_count, created_at, notes_url), ...]."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, episode_num, title, audio_url, duration_seconds, word_count, created_at, notes_url
         FROM audio_episodes WHERE chapter_id = %s ORDER BY episode_num
     ''', (chapter_id,))
     rows = cursor.fetchall()
